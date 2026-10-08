@@ -15,6 +15,10 @@ final class Cli
           --project=DIR          project root containing vendor/ (default: current directory)
           --out=DIR              output directory (default: <project>/tests/Testor)
           --max-cases=N          input combinations explored per method (default: 20)
+          --select=STRATEGY      both: keep a case if it has a new outcome or covers new lines (default)
+                                 outcome: one test per distinct outcome
+                                 coverage: smallest set of tests covering the same lines
+                                 (coverage and both need PCOV or Xdebug, else outcome is used)
           --allow-side-effects   also test methods that touch files, network, processes, sessions or headers
           -v, --verbose          show PHPUnit output for rejected tests
           -h, --help             show this help
@@ -24,7 +28,7 @@ final class Cli
     /** @param list<string> $argv */
     public function run(array $argv): int
     {
-        $options = ['project' => getcwd(), 'out' => null, 'max-cases' => '20'];
+        $options = ['project' => getcwd(), 'out' => null, 'max-cases' => '20', 'select' => 'both'];
         $flags = ['allow-side-effects' => false, 'verbose' => false];
         $paths = [];
 
@@ -37,7 +41,7 @@ final class Cli
                 $flags['verbose'] = true;
             } elseif ($arg === '--allow-side-effects') {
                 $flags['allow-side-effects'] = true;
-            } elseif (preg_match('/^--(project|out|max-cases)=(.+)$/', $arg, $m)) {
+            } elseif (preg_match('/^--(project|out|max-cases|select)=(.+)$/', $arg, $m)) {
                 $options[$m[1]] = $m[2];
             } elseif (str_starts_with($arg, '-')) {
                 fwrite(STDERR, "Unknown option: $arg\n\n" . self::USAGE);
@@ -72,18 +76,22 @@ final class Cli
 
         try {
             $generator = new Generator($project, (string) realpath($out), (int) $options['max-cases'],
-                $flags['allow-side-effects'], $flags['verbose']);
+                $flags['allow-side-effects'], $flags['verbose'], $options['select']);
             $reports = $generator->generate($resolved);
-        } catch (\RuntimeException $e) {
+        } catch (\RuntimeException|\InvalidArgumentException $e) {
             fwrite(STDERR, "error: {$e->getMessage()}\n");
             return 1;
         }
 
         $total = 0;
+        [$executable, $covered] = [0, 0];
         foreach ($reports as $r) {
             if ($r->output !== null) {
                 $total += $r->kept;
-                echo "✓ {$r->name}: {$r->kept} tests ({$r->explored} cases explored"
+                $executable += (int) $r->executableLines;
+                $covered += (int) $r->coveredLines;
+                $coverage = $r->coverage() === null ? '' : sprintf(', %.0f%% lines', $r->coverage());
+                echo "✓ {$r->name}: {$r->kept} tests$coverage ({$r->explored} cases explored"
                     . ($r->unstable ? ", {$r->unstable} unstable dropped" : '') . ") → {$r->output}\n";
             } else {
                 echo "- {$r->name}: " . ($r->error ?? 'no stable test produced') . "\n";
@@ -92,7 +100,11 @@ final class Cli
                 echo "    skipped $method(): $reason\n";
             }
         }
-        echo "\n$total tests generated.\n";
+        echo "\n$total tests generated.";
+        if ($executable > 0) {
+            printf(' Line coverage of the tested classes: %.1f%% (%d/%d).', 100 * $covered / $executable, $covered, $executable);
+        }
+        echo "\n";
         return 0;
     }
 }

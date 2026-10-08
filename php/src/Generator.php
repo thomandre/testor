@@ -32,7 +32,11 @@ final class Generator
         int $maxCases = 20,
         bool $allowSideEffects = false,
         private readonly bool $verbose = false,
+        private readonly string $select = 'both',
     ) {
+        if (!in_array($select, ['outcome', 'coverage', 'both'], true)) {
+            throw new \InvalidArgumentException("Unknown selection strategy: $select");
+        }
         $this->runner = new Runner($project);
         $this->renderer = new Renderer();
         $this->builder = new CaseBuilder($maxCases, $allowSideEffects);
@@ -73,27 +77,32 @@ final class Generator
             return $report;
         }
 
-        // 1. Recording pass: observe what the code actually does for each input.
-        [$outcomes, $output] = $this->record($class, $cases, $imports);
+        // 1. Recording pass: observe what the code actually does for each input (and the lines it runs).
+        [$records, $output] = $this->record($class, $cases, $imports);
+        $outcomes = $records['cases'] ?? [];
         if ($outcomes === []) {
             $report->error = "recording pass produced nothing:\n" . substr($output, -2000);
             return $report;
         }
 
-        // 2. Keep one case per distinct (method, outcome).
-        $seen = [];
-        $selected = [];
+        $candidates = [];
         foreach ($cases as $case) {
             $outcome = $outcomes[$case->id] ?? null;
             if ($outcome === null || $this->isNoise($outcome)) {
                 continue;
             }
-            $signature = $case->method['name'] . json_encode(self::sortKeys($outcome));
-            if (!isset($seen[$signature])) {
-                $seen[$signature] = true;
-                $selected[] = [$case, $outcome];
-            }
+            $lines = self::lineKeys($outcome['covered'] ?? []);
+            unset($outcome['covered']);
+            $candidates[] = [$case, $outcome, $lines];
         }
+
+        // 2. Selection: one test per distinct (method, outcome), and/or the smallest set covering the same lines.
+        $measured = isset($records['executable']);
+        $selected = match ($measured ? $this->select : 'outcome') {
+            'outcome' => $this->byOutcome($candidates),
+            'coverage' => $this->byCoverage($candidates),
+            'both' => self::union($candidates, $this->byOutcome($candidates), $this->byCoverage($candidates)),
+        };
 
         // 3. Gate: drop tests that fail or raise warnings; require two clean runs in a row.
         $nsParts = array_slice(explode('\\', $class['name']), 0, -1);
@@ -134,6 +143,9 @@ final class Generator
         if ($selected !== [] && $cleanRuns === 2) {
             $report->output = $target;
             $report->kept = count($selected);
+            if ($measured) {
+                [$report->executableLines, $report->coveredLines] = $this->classCoverage($class, $records['executable'], $selected);
+            }
         } elseif (is_file($target)) {
             unlink($target);
         }
@@ -141,10 +153,11 @@ final class Generator
     }
 
     /**
-     * Runs every scenario once and returns the observed outcome per scenario id, plus PHPUnit's output.
+     * Runs every scenario once and returns the records ({cases: id => outcome, executable: file => lines}),
+     * plus PHPUnit's output.
      *
      * @param list<Scenario> $cases
-     * @return array{array<string, array>, string}
+     * @return array{array, string}
      */
     private function record(array $class, array $cases, Imports $imports): array
     {
@@ -154,11 +167,100 @@ final class Generator
             $recordFile = "$tmp/records.json";
             file_put_contents($testFile, $this->renderer->recording($class, $cases, $imports, __DIR__ . '/Runtime/Recorder.php'));
             $result = $this->runner->run($testFile, ['TESTOR_RECORD_FILE' => $recordFile]);
-            $outcomes = is_file($recordFile) ? json_decode((string) file_get_contents($recordFile), true) : [];
-            return [$outcomes ?: [], $result->output];
+            $records = is_file($recordFile) ? json_decode((string) file_get_contents($recordFile), true) : [];
+            return [$records ?: [], $result->output];
         } finally {
             Process::removeDir($tmp);
         }
+    }
+
+    /** Candidates present in any of the selections, in their original order. */
+    private static function union(array $candidates, array ...$selections): array
+    {
+        $ids = [];
+        foreach ($selections as $selection) {
+            foreach ($selection as [$case]) {
+                $ids[$case->id] = true;
+            }
+        }
+        return array_values(array_filter($candidates, fn (array $c) => isset($ids[$c[0]->id])));
+    }
+
+    /** @param list<array{Scenario, array, list<string>}> $candidates */
+    private function byOutcome(array $candidates): array
+    {
+        $seen = [];
+        $selected = [];
+        foreach ($candidates as $candidate) {
+            [$case, $outcome] = $candidate;
+            $signature = $case->method['name'] . json_encode(self::sortKeys($outcome));
+            if (!isset($seen[$signature])) {
+                $seen[$signature] = true;
+                $selected[] = $candidate;
+            }
+        }
+        return $selected;
+    }
+
+    /**
+     * Greedy set cover: repeatedly take the case adding the most uncovered lines (earliest on ties),
+     * until no case adds any. Selected cases keep their original order.
+     *
+     * @param list<array{Scenario, array, list<string>}> $candidates
+     */
+    private function byCoverage(array $candidates): array
+    {
+        $covered = [];
+        $picked = [];
+        while (true) {
+            $best = null;
+            $bestGain = 0;
+            foreach ($candidates as $i => [, , $lines]) {
+                if (isset($picked[$i])) {
+                    continue;
+                }
+                $gain = count(array_diff_key(array_flip($lines), $covered));
+                if ($gain > $bestGain) {
+                    [$best, $bestGain] = [$i, $gain];
+                }
+            }
+            if ($best === null) {
+                break;
+            }
+            $picked[$best] = true;
+            $covered += array_flip($candidates[$best][2]);
+        }
+        ksort($picked);
+        return array_values(array_intersect_key($candidates, $picked));
+    }
+
+    /**
+     * Executable and covered lines of the class body (its own file and line range).
+     *
+     * @return array{int, int}
+     */
+    private function classCoverage(array $class, array $executable, array $selected): array
+    {
+        $inClass = fn (int $line) => $line >= $class['startLine'] && $line <= $class['endLine'];
+        $lines = array_filter($executable[$class['file']] ?? [], $inClass);
+        $covered = [];
+        foreach ($selected as [, , $keys]) {
+            $covered += array_flip($keys);
+        }
+        $hit = array_filter($lines, fn (int $line) => isset($covered["{$class['file']}:$line"]));
+        return [count($lines), count($hit)];
+    }
+
+    /** @param array<string, list<int>> $covered file => lines */
+    private static function lineKeys(array $covered): array
+    {
+        $keys = [];
+        foreach ($covered as $file => $lines) {
+            foreach ($lines as $line) {
+                $keys[] = "$file:$line";
+            }
+        }
+        return $keys;
     }
 
     private function isNoise(array $outcome): bool

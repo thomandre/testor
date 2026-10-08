@@ -15,6 +15,16 @@ final class ClassReport
         public int $unstable = 0,
         public array $skipped = [],
         public ?string $error = null,
+        public ?int $executableLines = null, // null when no coverage driver is available
+        public ?int $coveredLines = null,
     ) {
+    }
+
+    public function coverage(): ?float
+    {
+        if ($this->executableLines === null) {
+            return null;
+        }
+        return $this->executableLines === 0 ? 100.0 : 100 * $this->coveredLines / $this->executableLines;
     }
 }

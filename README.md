@@ -19,7 +19,11 @@ vendor/bin/testor src/
 ```
 
 Options: `--project=DIR` (default: cwd), `--out=DIR` (default: `<project>/tests/Testor`),
-`--max-cases=N` (default 20), `--allow-side-effects`, `-v`.
+`--max-cases=N` (default 20), `--select=both|outcome|coverage`, `--allow-side-effects`, `-v`.
+
+**Coverage:** with PCOV (recommended, `pecl install pcov`) or Xdebug in coverage mode, testor measures
+the lines each case executes and reports line coverage for every tested class. Without a coverage driver,
+everything still works: selection falls back to `outcome` and no coverage is reported.
 
 The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
 
@@ -39,9 +43,19 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
    a static factory (`from(): static`) is used instead.
 4. **Recording:** a temporary test file runs every case, and `Runtime/Recorder.php` captures the outcome
    (value, exception, object…, or PHP warnings).
-5. **Selection:** one test per distinct (method, outcome) pair. Discarded: `TypeError` results caused by
-   testor's own inputs, and cases that raise warnings, notices or deprecations.
+5. **Selection:** discarded cases are the `TypeError` results caused by testor's own inputs and the cases
+   that raise warnings, notices or deprecations. Among the remaining cases, a case is kept if:
+   - `both` (default): it produces a new outcome for its method **or** it covers new lines;
+   - `outcome`: it produces a new (method, outcome) pair;
+   - `coverage`: it belongs to the smallest set covering the same lines (greedy set cover).
+
+   On phpMyAdmin (16 classes), `outcome` keeps 218 tests (59.5 % line coverage), `coverage` keeps 121 tests
+   (60.6 %) and `both` keeps 232 tests (60.9 %). Different inputs can return the same value through different
+   branches, and different values can come from a single line (`return $a ? 'x' : 'y';`): each strategy
+   misses what the other one catches.
 6. **Gate:** tests that fail or raise warnings (read from PHPUnit's event log) are removed.
+   PHPUnit always runs with `--no-coverage --no-logging`, so the project's own coverage reports and logs
+   are never produced (they are slow, and they would write into the project).
    Two consecutive clean runs are required. Generated classes use `#[BackupGlobals]` and
    `#[BackupStaticProperties]` so results don't depend on test order.
 
@@ -61,7 +75,7 @@ php/bin/testor --project=examples/php-demo examples/php-demo/src
 ```bash
 cd php
 php ../.tools/composer.phar install
-vendor/bin/phpunit                       # unit + integration (~4 s)
+composer test                            # unit + integration (~5 s); sets pcov.directory
 vendor/bin/phpunit --testsuite unit      # unit only, no external process
 ```
 

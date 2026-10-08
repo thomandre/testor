@@ -96,6 +96,33 @@ final class GeneratorTest extends DemoProjectTestCase
         $this->assertSame('abstract: skipped', self::$reports['App\Io\AbstractExporter']->error);
     }
 
+    public function testLineCoverageIsReportedPerClass(): void
+    {
+        if (\Testor\Runtime\Recorder::driver() === null) {
+            $this->markTestSkipped('needs PCOV or Xdebug (coverage mode)');
+        }
+        $this->assertSame(100.0, self::$reports['App\Report\Formatter']->coverage());
+        // export() is skipped (side effects), so only toCsv() is covered.
+        $this->assertSame(50.0, self::$reports['App\Io\CsvExporter']->coverage());
+    }
+
+    public function testCoverageStrategyKeepsFewerTestsForTheSameCoverage(): void
+    {
+        if (\Testor\Runtime\Recorder::driver() === null) {
+            $this->markTestSkipped('needs PCOV or Xdebug (coverage mode)');
+        }
+        $out = Process::tempDir();
+        try {
+            [$report] = (new Generator(self::demo(), $out, select: 'coverage'))->generate([self::demo() . '/src/Math']);
+        } finally {
+            Process::removeDir($out);
+        }
+        $full = self::$reports['App\Math\Calculator'];
+
+        $this->assertLessThan($full->kept, $report->kept);
+        $this->assertSame($full->coverage(), $report->coverage());
+    }
+
     public function testGeneratedSuitePassesWithoutWarnings(): void
     {
         $result = (new Runner(self::demo()))->run(self::$out);

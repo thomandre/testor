@@ -35,7 +35,13 @@ final class Runner
         try {
             $junit = "$tmp/junit.xml";
             $events = "$tmp/events.txt";
-            $cmd = [PHP_BINARY, "$this->project/vendor/bin/phpunit", '--do-not-cache-result',
+            $cmd = [
+                PHP_BINARY,
+                // PCOV only instruments src/ (or lib/, app/) by default: measure the whole project but vendor/.
+                '-d', "pcov.directory=$this->project", '-d', 'pcov.exclude=~/vendor/~',
+                "$this->project/vendor/bin/phpunit", '--do-not-cache-result',
+                // Never run the project's own coverage reports or logs: slow, and they write into the project.
+                '--no-coverage', '--no-logging',
                 '--log-junit', $junit, '--log-events-text', $events];
             $hasConfig = array_filter(self::CONFIG_FILES, fn (string $f) => is_file("$this->project/$f"));
             if (!$hasConfig) {

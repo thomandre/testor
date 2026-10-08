@@ -7,6 +7,7 @@ namespace Testor\Tests\Unit\Runtime;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
 use Testor\Runtime\Recorder;
+use Testor\Tests\Unit\Runtime\Fixtures\Branchy;
 
 enum Suit
 {
@@ -36,7 +37,7 @@ final class RecorderTest extends TestCase
     private function record(callable $call): array
     {
         Recorder::record('id', $call);
-        return json_decode((string) file_get_contents($this->file), true)['id'];
+        return json_decode((string) file_get_contents($this->file), true)['cases']['id'];
     }
 
     public function testScalarsAndArraysAreExportedAsPhpCode(): void
@@ -98,6 +99,34 @@ final class RecorderTest extends TestCase
         Recorder::record('a', fn () => 1);
         Recorder::record('b', fn () => 2);
 
-        $this->assertSame(['a', 'b'], array_keys(json_decode((string) file_get_contents($this->file), true)));
+        $this->assertSame(['a', 'b'], array_keys(json_decode((string) file_get_contents($this->file), true)['cases']));
+    }
+
+    public function testNoCoverageUnlessStarted(): void
+    {
+        $this->assertArrayNotHasKey('covered', $this->record(fn () => 1));
+        $this->assertArrayNotHasKey('executable', json_decode((string) file_get_contents($this->file), true));
+    }
+
+    public function testCoverageOfTheCallIsMeasured(): void
+    {
+        if (Recorder::driver() === null) {
+            $this->markTestSkipped('needs PCOV or Xdebug (coverage mode)');
+        }
+        $file = (string) realpath(__DIR__ . '/Fixtures/Branchy.php');
+        $dir = (string) ini_get('pcov.directory');
+        if (Recorder::driver() === 'pcov' && ($dir === '' || !str_starts_with($file, (string) realpath($dir)))) {
+            $this->markTestSkipped('PCOV does not instrument tests/: run `composer test` (sets pcov.directory)');
+        }
+
+        Recorder::start([$file]);
+        $sut = new Branchy();
+        Recorder::record('id', fn () => $sut->answer(true));
+
+        $data = json_decode((string) file_get_contents($this->file), true);
+        $this->assertContains(12, $data['cases']['id']['covered'][$file]);
+        $this->assertNotContains(14, $data['cases']['id']['covered'][$file]);
+        $this->assertContains(14, $data['executable'][$file]);
+        $this->assertSame('value', $data['cases']['id']['kind']);
     }
 }

@@ -30,6 +30,6 @@
         }
     },
     "scripts": {
-        "test": "phpunit"
+        "test": "@php -d pcov.directory=. vendor/bin/phpunit"
     }
 }

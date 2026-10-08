@@ -233,6 +233,8 @@ foreach ($request['files'] as $file) {
                 'constructor' => $ctor && $ctor->isPublic() ? describeParams($ctor) : ($ctor ? null : []),
                 'methods' => $methods,
                 'ancestorFiles' => ancestorFiles($ref),
+                'startLine' => $ref->getStartLine(),
+                'endLine' => $ref->getEndLine(),
             ];
         } catch (Throwable $e) {
             $result['errors'][] = ['class' => $className, 'file' => $file, 'error' => $e->getMessage()];

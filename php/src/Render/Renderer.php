@@ -59,9 +59,13 @@ final class Renderer
         $imports->ref('PHPUnit\\Framework\\TestCase');
         $sut = $imports->ref($class['name']);
         $body = [];
+        $cover = array_map(self::phpString(...), [$class['file'], ...$class['ancestorFiles'] ?? []]);
+        $body = ['    private const COVER = [' . implode(', ', $cover) . '];', ''];
         foreach ($cases as $case) {
             [$setup, $call] = $this->arrange($case, $sut);
             $body = [...$body, ...$this->method("test_{$case->id}", [
+                // Measure from construction on, so constructor lines count as covered.
+                '\\' . self::RECORDER . '::start(self::COVER);',
                 ...$setup,
                 '\\' . self::RECORDER . "::record('{$case->id}', fn () => $call);",
                 '$this->addToAssertionCount(1);',
