@@ -1,0 +1,35 @@
+{
+    "name": "testor/testor",
+    "description": "Unit test generator for PHP that works without an LLM: characterization tests for PHPUnit.",
+    "type": "library",
+    "license": "MIT",
+    "bin": [
+        "bin/testor"
+    ],
+    "require": {
+        "php": ">=8.2",
+        "ext-dom": "*",
+        "ext-json": "*",
+        "ext-tokenizer": "*",
+        "nikic/php-parser": "^5.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Testor\\": "src/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^12"
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Testor\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    }
+}

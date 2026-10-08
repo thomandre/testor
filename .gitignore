@@ -1,0 +1,7 @@
+.tools/
+php/vendor/
+php/composer.lock
+examples/*/vendor/
+examples/*/composer.lock
+examples/*/tests/Testor/
+php/.phpunit.cache/

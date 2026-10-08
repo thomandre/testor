@@ -1,0 +1,91 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Testor\PhpUnit;
+
+use Testor\Process;
+
+/** Runs PHPUnit in the target project and reports, per test method, failures and warnings. */
+final class Runner
+{
+    // e.g. "Test Triggered PHP Warning (Tests\FooTest::testBar) in /src/Foo.php:12"
+    private const EVENT_NOTICE = '/^Test Triggered (?:PHP )?(?:Warning|Notice|Deprecation) \((?<test>[^,)]+)(?<extra>[^)]*)\)/m';
+    private const CONFIG_FILES = ['phpunit.xml', 'phpunit.xml.dist', 'phpunit.dist.xml'];
+
+    public function __construct(private readonly string $project)
+    {
+    }
+
+    public function check(): ?string
+    {
+        if (!is_file("$this->project/vendor/autoload.php")) {
+            return "$this->project/vendor/autoload.php not found: run `composer install` in the project";
+        }
+        if (!is_file("$this->project/vendor/bin/phpunit")) {
+            return 'vendor/bin/phpunit not found: add phpunit/phpunit to require-dev';
+        }
+        return null;
+    }
+
+    /** @param array<string, string> $env */
+    public function run(string $testFile, array $env = []): RunResult
+    {
+        $tmp = Process::tempDir();
+        try {
+            $junit = "$tmp/junit.xml";
+            $events = "$tmp/events.txt";
+            $cmd = [PHP_BINARY, "$this->project/vendor/bin/phpunit", '--do-not-cache-result',
+                '--log-junit', $junit, '--log-events-text', $events];
+            $hasConfig = array_filter(self::CONFIG_FILES, fn (string $f) => is_file("$this->project/$f"));
+            if (!$hasConfig) {
+                $cmd = [...$cmd, '--bootstrap', "$this->project/vendor/autoload.php"];
+            }
+            $cmd[] = $testFile;
+
+            [$code, $stdout, $stderr] = Process::run($cmd, $this->project, $env);
+            [$failed, $passed] = $this->parseJunit($junit);
+            return new RunResult($code, $stdout . $stderr, $failed, $passed, $this->parseEvents($events));
+        } finally {
+            Process::removeDir($tmp);
+        }
+    }
+
+    /** @return array{list<string>, list<string>} */
+    private function parseJunit(string $path): array
+    {
+        $failed = [];
+        $passed = [];
+        if (!is_file($path)) {
+            return [$failed, $passed];
+        }
+        $doc = new \DOMDocument();
+        $doc->load($path);
+        foreach ($doc->getElementsByTagName('testcase') as $tc) {
+            $broken = $tc->getElementsByTagName('failure')->length + $tc->getElementsByTagName('error')->length > 0;
+            if ($broken) {
+                $failed[] = $tc->getAttribute('name');
+            } else {
+                $passed[] = $tc->getAttribute('name');
+            }
+        }
+        return [$failed, $passed];
+    }
+
+    /** @return list<string> */
+    private function parseEvents(string $path): array
+    {
+        if (!is_file($path)) {
+            return [];
+        }
+        preg_match_all(self::EVENT_NOTICE, (string) file_get_contents($path), $matches, PREG_SET_ORDER);
+        $noisy = [];
+        foreach ($matches as $m) {
+            if (!str_contains($m['extra'], 'suppressed')) {
+                $parts = explode('::', $m['test']);
+                $noisy[] = end($parts);
+            }
+        }
+        return array_values(array_unique($noisy));
+    }
+}
