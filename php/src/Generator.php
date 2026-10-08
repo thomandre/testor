@@ -7,6 +7,7 @@ namespace Testor;
 use Testor\Cases\CaseBuilder;
 use Testor\Cases\Imports;
 use Testor\Cases\Scenario;
+use Testor\Cases\Values;
 use Testor\PhpUnit\Runner;
 use Testor\Render\Renderer;
 
@@ -24,13 +25,13 @@ final class Generator
 
     private readonly Runner $runner;
     private readonly Renderer $renderer;
-    private readonly CaseBuilder $builder;
+    private Values $values;
 
     public function __construct(
         private readonly string $project,
         private readonly string $outDir,
-        int $maxCases = 20,
-        bool $allowSideEffects = false,
+        private readonly int $maxCases = 20,
+        private readonly bool $allowSideEffects = false,
         private readonly bool $verbose = false,
         private readonly string $select = 'both',
     ) {
@@ -39,7 +40,6 @@ final class Generator
         }
         $this->runner = new Runner($project);
         $this->renderer = new Renderer();
-        $this->builder = new CaseBuilder($maxCases, $allowSideEffects);
     }
 
     /**
@@ -54,6 +54,7 @@ final class Generator
         }
 
         $data = (new Introspector())->describe($this->project, $this->phpFiles($paths));
+        $this->values = new Values($data['types']);
         $reports = array_map(fn (array $e) => new ClassReport($e['class'], error: $e['error']), $data['errors']);
         foreach ($data['classes'] as $class) {
             $reports[] = $this->generateClass($class);
@@ -70,7 +71,8 @@ final class Generator
         }
 
         $imports = new Imports(); // filled by the value strategies (stubs, enums, constants)
-        [$cases, $report->skipped] = $this->builder->build($class, $imports);
+        $builder = new CaseBuilder($this->maxCases, $this->allowSideEffects, $this->values->withHints($class['readProperties']));
+        [$cases, $report->skipped] = $builder->build($class, $imports);
         $report->explored = count($cases);
         if ($cases === []) {
             $report->error = 'no testable public method';

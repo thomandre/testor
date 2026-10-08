@@ -19,7 +19,19 @@ use PhpParser\ParserFactory;
  * Static analysis of source files (no code is loaded): per class and method, the side
  * effects it may have and the inferred domain of each parameter.
  *
- * Result: [FQCN => [lowercase method => ['sideEffects' => list<string>, 'domains' => [param => domain|null]]]]
+ * Result: [FQCN => [
+ *     'ctorProperties' => [constructor param => property it is stored in],
+ *     'methods' => [lowercase method => [
+ *         'sideEffects' => list<string>,
+ *         'domains' => [param => domain|null],
+ *         'paramNames' => list<string>,
+ *         'calls' => ['property' => [property => list<method>], 'variable' => [variable => list<method>]],
+ *         'flows' => where dependency return values go (see DomainExtractor::dependencyFlows()),
+ *     ]],
+ *     'readProperties' => names of properties read on other objects,
+ * ]]
+ * Calls are the methods invoked on dependencies ($this->prop->m(), $param->m()), lowercase;
+ * like side effects, calls through the class's own methods are followed.
  */
 final class SourceAnalyzer
 {
@@ -102,9 +114,16 @@ final class SourceAnalyzer
                         $paramDomains[$param->var->name] = $domains->domain($method, $param->var->name);
                     }
                 }
-                $methods[$method->name->toLowerString()] = ['effects' => $effects, 'calls' => $calls, 'domains' => $paramDomains];
+                // Flows of dependency return values propagate to callers like effects do.
+                foreach ($domains->dependencyFlows($method) as $flow) {
+                    $effects[] = 'flow:' . json_encode($flow, JSON_THROW_ON_ERROR);
+                }
+                $methods[$method->name->toLowerString()] = ['effects' => $effects, 'calls' => $calls,
+                    'domains' => $paramDomains, 'paramNames' => array_keys($paramDomains)];
             }
-            $this->raw[$name] = ['parent' => $parent, 'traits' => $traits, 'isTrait' => $class instanceof Stmt\Trait_, 'methods' => $methods];
+            $this->raw[$name] = ['parent' => $parent, 'traits' => $traits, 'isTrait' => $class instanceof Stmt\Trait_,
+                'methods' => $methods, 'ctorProperties' => $this->ctorProperties($class),
+                'readProperties' => $this->readProperties($class)];
         } catch (\Throwable $e) {
             // Degrade gracefully: no domains/side effects for this class.
             fwrite(STDERR, "warning: static analysis of $name failed: {$e->getMessage()}\n");
@@ -145,12 +164,71 @@ final class SourceAnalyzer
 
         $methods = [];
         foreach ($table as $name => $origin) {
+            $sideEffects = [];
+            $calls = ['property' => [], 'variable' => []];
+            $flows = [];
+            foreach (array_unique($effects[$origin]) as $effect) {
+                if (preg_match('/^call:(property|variable):(\w+)->(\w+)$/', $effect, $m)) {
+                    $calls[$m[1]][$m[2]][] = $m[3];
+                } elseif (str_starts_with($effect, 'flow:')) {
+                    $flows[] = json_decode(substr($effect, 5), true);
+                } else {
+                    $sideEffects[] = $effect;
+                }
+            }
             $methods[$name] = [
-                'sideEffects' => array_values(array_unique($effects[$origin])),
+                'sideEffects' => $sideEffects,
                 'domains' => $this->rawMethod($origin)['domains'] ?? [],
+                'paramNames' => $this->rawMethod($origin)['paramNames'] ?? [],
+                'calls' => $calls,
+                'flows' => $flows,
             ];
         }
-        return $methods;
+
+        $ctorOrigin = $table['__construct'] ?? null;
+        $ctorClass = $ctorOrigin === null ? $class : substr($ctorOrigin, 0, strrpos($ctorOrigin, '::'));
+        return [
+            'ctorProperties' => $this->raw[$ctorClass]['ctorProperties'] ?? [],
+            'readProperties' => $this->raw[$class]['readProperties'] ?? [],
+            'methods' => $methods,
+        ];
+    }
+
+    /** Names of the properties the class reads on other objects ($order->status, $x?->feature). */
+    private function readProperties(Stmt\ClassLike $class): array
+    {
+        $names = [];
+        $fetches = (new NodeFinder())->find($class->stmts, fn (Node $n) => $n instanceof Expr\PropertyFetch || $n instanceof Expr\NullsafePropertyFetch);
+        foreach ($fetches as $fetch) {
+            $onThis = $fetch->var instanceof Expr\Variable && $fetch->var->name === 'this';
+            if (!$onThis && $fetch->name instanceof Node\Identifier) {
+                $names[$fetch->name->toString()] = true;
+            }
+        }
+        return array_keys($names);
+    }
+
+    /** Constructor parameter => property: promoted parameters and `$this->prop = $param;` assignments. */
+    private function ctorProperties(Stmt\ClassLike $class): array
+    {
+        $ctor = $class->getMethod('__construct');
+        if ($ctor === null) {
+            return [];
+        }
+        $map = [];
+        foreach ($ctor->params as $param) {
+            if ($param->flags !== 0 && $param->var instanceof Expr\Variable && is_string($param->var->name)) {
+                $map[$param->var->name] = $param->var->name;
+            }
+        }
+        foreach ((new NodeFinder())->findInstanceOf($ctor->stmts ?? [], Expr\Assign::class) as $assign) {
+            if ($assign->var instanceof Expr\PropertyFetch && $assign->var->var instanceof Expr\Variable
+                && $assign->var->var->name === 'this' && $assign->var->name instanceof Node\Identifier
+                && $assign->expr instanceof Expr\Variable && is_string($assign->expr->name)) {
+                $map[$assign->expr->name] = $assign->var->name->toString();
+            }
+        }
+        return $map;
     }
 
     /**
@@ -220,6 +298,18 @@ final class SourceAnalyzer
                 && $node->var instanceof Expr\Variable && $node->var->name === 'this'
                 && $node->name instanceof Node\Identifier) {
                 $internal[] = ['this', $node->name->toLowerString()];
+            } elseif (($node instanceof Expr\MethodCall || $node instanceof Expr\NullsafeMethodCall)
+                && $node->name instanceof Node\Identifier) {
+                // Calls on dependencies, $this->prop->m() and $variable->m(): recorded like
+                // effects (prefixed) so they propagate through the class's own methods too.
+                $target = $node->var;
+                if (($target instanceof Expr\PropertyFetch || $target instanceof Expr\NullsafePropertyFetch)
+                    && $target->var instanceof Expr\Variable && $target->var->name === 'this'
+                    && $target->name instanceof Node\Identifier) {
+                    $effects[] = "call:property:{$target->name->toString()}->{$node->name->toLowerString()}";
+                } elseif ($target instanceof Expr\Variable && is_string($target->name)) {
+                    $effects[] = "call:variable:{$target->name}->{$node->name->toLowerString()}";
+                }
             } elseif ($node instanceof Expr\StaticCall && $node->class instanceof Name
                 && in_array($node->class->toLowerString(), ['self', 'static', 'parent'], true)
                 && $node->name instanceof Node\Identifier) {

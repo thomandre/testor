@@ -52,7 +52,7 @@ final class SourceAnalyzerTest extends TestCase
                 public function m($signature) { $body }
             }
             PHP]);
-        return $result['App\Sut']['m']['domains']['p'];
+        return $result['App\Sut']['methods']['m']['domains']['p'];
     }
 
     /** @return list<string|array> literal expressions, or the constant references */
@@ -212,7 +212,7 @@ final class SourceAnalyzerTest extends TestCase
 
     private function effects(array $sources, string $class): array
     {
-        return array_map(fn (array $m) => $m['sideEffects'], $this->analyse($sources)[$class]);
+        return array_map(fn (array $m) => $m['sideEffects'], $this->analyse($sources)[$class]['methods']);
     }
 
     public function testDirectAndTransitiveSideEffects(): void
@@ -305,6 +305,94 @@ final class SourceAnalyzerTest extends TestCase
         ], 'App\Svc');
 
         $this->assertSame(['error_log'], $effects['close']);
+    }
+
+    // ---- Dependencies -----------------------------------------------------------------
+
+    public function testCallsOnDependenciesAreCollectedAndFollowed(): void
+    {
+        $class = $this->analyse(['Svc.php' => <<<'PHP'
+            namespace App;
+            final class Svc
+            {
+                private Clock $clock;
+                public function __construct(private Repo $repo, Clock $clock, Logger $logger)
+                {
+                    $this->clock = $clock;
+                    $logger->info('created');
+                }
+                public function run(Mailer $mailer): void
+                {
+                    $mailer->send($this->repo->find(1));
+                    $this->stamp();
+                }
+                private function stamp(): void { $this->clock?->now(); }
+            }
+            PHP])['App\Svc'];
+
+        $this->assertSame(['repo' => 'repo', 'clock' => 'clock'], $class['ctorProperties']);
+        $this->assertSame(
+            ['property' => ['repo' => ['find'], 'clock' => ['now']], 'variable' => ['mailer' => ['send']]],
+            $class['methods']['run']['calls'],
+        );
+        $this->assertSame(['property' => [], 'variable' => ['logger' => ['info']]], $class['methods']['__construct']['calls']);
+        $this->assertSame([], $class['methods']['run']['sideEffects'], 'dependency calls are not side effects');
+    }
+
+    public function testInheritedConstructorPropertiesAreUsed(): void
+    {
+        $class = $this->analyse([
+            'Base.php' => 'namespace App; abstract class Base { public function __construct(protected Repo $repo) {} }',
+            'Child.php' => 'namespace App; final class Child extends Base { public function all(): array { return $this->repo->all(); } }',
+        ])['App\Child'];
+
+        $this->assertSame(['repo' => 'repo'], $class['ctorProperties']);
+        $this->assertSame(['repo' => ['all']], $class['methods']['all']['calls']['property']);
+    }
+
+    public function testWhereDependencyReturnValuesGo(): void
+    {
+        $methods = $this->analyse(['Svc.php' => <<<'PHP'
+            namespace App;
+            use App\Rules\Policy;
+            final class Svc
+            {
+                public function __construct(private Db $db) {}
+                public function run(Repo $repo): string
+                {
+                    if ($this->db->query() === false) { return 'failed'; }
+                    $version = $this->db->version();
+                    if ($version >= 80000) { return 'new'; }
+                    return Policy::check((int) $this->db->charset(), $repo->count()) ? 'ok' : $this->label($repo->name());
+                }
+                private function label(string $name): string { return $name; }
+            }
+            PHP])['App\Svc']['methods'];
+
+        $this->assertSame([
+            ['dep' => ['property', 'db', 'query'], 'items' => [['expr' => 'false', 'type' => 'bool']]],
+            ['dep' => ['property', 'db', 'version'], 'items' => [
+                ['expr' => '79999', 'type' => 'int'], ['expr' => '80000', 'type' => 'int'], ['expr' => '80001', 'type' => 'int'],
+            ]],
+            ['dep' => ['property', 'db', 'charset'], 'call' => ['App\Rules\Policy', 'check', 0]],
+            ['dep' => ['variable', 'repo', 'count'], 'call' => ['App\Rules\Policy', 'check', 1]],
+            ['dep' => ['variable', 'repo', 'name'], 'call' => ['App\Svc', 'label', 0]],
+        ], $methods['run']['flows']);
+        $this->assertSame(['name'], $methods['label']['paramNames']);
+    }
+
+    public function testPropertiesReadOnOtherObjects(): void
+    {
+        $class = $this->analyse(['Svc.php' => <<<'PHP'
+            namespace App;
+            final class Svc
+            {
+                private int $count = 0;
+                public function run(Order $order): bool { return $order->status === 1 && $order?->paid && $this->count > 0; }
+            }
+            PHP])['App\Svc'];
+
+        $this->assertSame(['status', 'paid'], $class['readProperties']);
     }
 
     public function testUnparsableFileIsSkipped(): void

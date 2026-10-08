@@ -10,6 +10,7 @@ use Testor\Cases\Arg;
 use Testor\Cases\CaseBuilder;
 use Testor\Cases\Imports;
 use Testor\Cases\Scenario;
+use Testor\Cases\Values;
 use Testor\Tests\Support\Descriptors;
 
 #[CoversClass(CaseBuilder::class)]
@@ -17,10 +18,32 @@ final class CaseBuilderTest extends TestCase
 {
     use Descriptors;
 
+    /** @var array<string, array> class registry */
+    private array $types = [];
+
     /** @return array{list<Scenario>, list<array{string, string}>} */
     private function build(array $class, int $maxCases = 20, bool $allowSideEffects = false): array
     {
-        return (new CaseBuilder($maxCases, $allowSideEffects))->build($class, new Imports());
+        return (new CaseBuilder($maxCases, $allowSideEffects, new Values($this->types)))->build($class, new Imports());
+    }
+
+    /** Registers a dependency interface whose methods return the given types. */
+    private function dependency(string $name, array $methods): array
+    {
+        $this->types[$name] = self::typeInfo(['isInterface' => true, 'methods' => array_combine(
+            array_map('strtolower', array_keys($methods)),
+            array_map(fn (string $m, ?array $t) => ['name' => $m, 'returnType' => $t], array_keys($methods), $methods),
+        )]);
+        return self::classType($name);
+    }
+
+    /** @return list<array<string, string>> the stub configuration of argument $i in each scenario */
+    private static function returns(array $scenarios, string $arg): array
+    {
+        return array_map(function (Scenario $s) use ($arg) {
+            $all = [...$s->construction?->args ?? [], ...$s->args];
+            return array_values(array_filter($all, fn (Arg $a) => $a->name === $arg))[0]->val->returns;
+        }, $scenarios);
     }
 
     /** @return list<string> e.g. "add(1, 0)" */
@@ -95,8 +118,9 @@ final class CaseBuilderTest extends TestCase
 
     public function testConstructorGetsBaselineValues(): void
     {
+        $this->types['App\Clock'] = self::typeInfo(['isInterface' => true]);
         $class = self::classDescriptor('App\Svc', [self::method('run')], [
-            self::param('clock', self::classType('App\Clock', ['isInterface' => true])),
+            self::param('clock', self::classType('App\Clock')),
             self::param('retries', self::builtin('int'), ['optional' => true]),
         ]);
 
@@ -105,6 +129,50 @@ final class CaseBuilderTest extends TestCase
         $this->assertNull($construction->factory);
         $this->assertSame(['clock'], array_map(fn (Arg $a) => $a->name, $construction->args), 'optional parameters use their default');
         $this->assertSame('$this->createStub(Clock::class)', $construction->args[0]->val->expr);
+    }
+
+    public function testStubReturnValuesAreExploredOneAtATime(): void
+    {
+        $gateway = $this->dependency('App\Gateway', ['charge' => self::builtin('bool'), 'fee' => self::builtin('float'), 'log' => self::builtin('void')]);
+        $class = self::classDescriptor('App\Svc', [
+            self::method('pay', extra: ['calls' => ['property' => ['gateway' => ['charge', 'fee', 'log']], 'variable' => []]]),
+            self::method('name'),
+        ], [self::param('gateway', $gateway)]);
+        $class['ctorProperties'] = ['gateway' => 'gateway'];
+
+        [$scenarios] = $this->build($class);
+        $pay = array_values(array_filter($scenarios, fn (Scenario $s) => $s->method['name'] === 'pay'));
+        $name = array_values(array_filter($scenarios, fn (Scenario $s) => $s->method['name'] === 'name'));
+
+        $this->assertSame([
+            ['charge' => 'true', 'fee' => '1.5'],
+            ['charge' => 'false', 'fee' => '1.5'],
+            ['charge' => 'true', 'fee' => '0.0'],
+            ['charge' => 'true', 'fee' => '-2.5'],
+        ], self::returns($pay, 'gateway'), 'void methods are not configured');
+        $this->assertSame([[]], self::returns($name, 'gateway'), 'methods not calling the dependency leave it unconfigured');
+    }
+
+    public function testMethodsCalledByTheConstructorAreConfiguredInEveryScenario(): void
+    {
+        $relation = $this->dependency('App\Relation', ['params' => self::builtin('array')]);
+        $class = self::classDescriptor('App\Svc', [self::method('run')], [self::param('relation', $relation)]);
+        $class['constructorCalls'] = ['property' => [], 'variable' => ['relation' => ['params']]];
+
+        [$scenarios] = $this->build($class);
+
+        $this->assertSame(['params' => '[1, 2, 3]'], self::returns($scenarios, 'relation')[0]);
+    }
+
+    public function testStubParametersOfTheMethodAreConfiguredToo(): void
+    {
+        $repo = $this->dependency('App\Repo', ['exists' => self::builtin('bool')]);
+        $class = self::classDescriptor('App\Svc', [self::method('check', [self::param('repo', $repo)],
+            ['calls' => ['property' => [], 'variable' => ['repo' => ['exists']]]])]);
+
+        [$scenarios] = $this->build($class);
+
+        $this->assertSame([['exists' => 'true'], ['exists' => 'false']], self::returns($scenarios, 'repo'));
     }
 
     public function testPrivateConstructorFallsBackToStaticFactory(): void

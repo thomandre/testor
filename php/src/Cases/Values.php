@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace Testor\Cases;
 
 /**
- * Deterministic candidate input values for PHP parameter types.
+ * Deterministic candidate input values for PHP types.
  *
  * The first candidate of each list is the "baseline" (a typical, valid value);
- * the others are edge cases explored one parameter at a time.
+ * the others are edge cases explored one at a time.
  */
 final class Values
 {
@@ -39,18 +39,60 @@ final class Values
         'mixed' => ['string', 'int', 'float', 'bool', 'null'],
     ];
 
+    /** Objects are built from their constructor or factory arguments, recursively up to this depth. */
+    private const MAX_BUILD_DEPTH = 4;
+    /** Variants of a built object (optional arguments set) beyond its baseline construction. */
+    private const MAX_OBJECT_VARIANTS = 4;
+
+    /** @var list<string> names of the properties the code under test reads on objects */
+    private array $hints = [];
+
+    /** @param array<string, array> $types class registry from the reflection worker */
+    public function __construct(private readonly array $types = [])
+    {
+    }
+
+    /**
+     * Optional constructor arguments named after properties the code under test reads
+     * (`$order->status`) get varied when objects are built; the others keep their default.
+     *
+     * @param list<string> $propertyNames
+     */
+    public function withHints(array $propertyNames): self
+    {
+        $clone = clone $this;
+        $clone->hints = $propertyNames;
+        return $clone;
+    }
+
+    public function type(string $class): ?array
+    {
+        $info = $this->types[$class] ?? null;
+        return ($info['exists'] ?? false) ? $info : null;
+    }
+
+    /** True when values of this type are PHPUnit stubs (interfaces, abstract and non-final classes). */
+    public function isStubbable(?array $type): bool
+    {
+        if ($type === null || $type['kind'] !== 'named' || $type['builtin'] || isset(self::DATE_CLASSES[$type['name']])) {
+            return false;
+        }
+        $info = $this->type($type['name']);
+        return $info !== null && !$info['isEnum'] && !$info['isFinal'];
+    }
+
     /**
      * Domain values first, then — unless the PHPDoc domain is exhaustive — one generic
      * "other" value (and null when allowed) to exercise the fallback branch.
      *
      * @return list<Val>|null null when no value strategy exists for the type
      */
-    public static function forParam(array $param, Imports $imports): ?array
+    public function forParam(array $param, Imports $imports): ?array
     {
         $type = $param['type'];
         $domain = $param['domain'] ?? null;
-        $generic = self::candidates($type, $imports);
-        $fromDomain = self::fromDomain($type, $domain, $imports);
+        $generic = $this->candidates($type, $imports);
+        $fromDomain = $this->fromDomain($type, $domain, $imports);
         if ($fromDomain === []) {
             return $generic;
         }
@@ -73,8 +115,36 @@ final class Values
         return $fromDomain;
     }
 
+    /**
+     * Values a stub may return for a method's return type. A null entry means "leave PHPUnit's
+     * default" (an automatic stub, for non-final object types).
+     *
+     * @return list<Val|null>
+     */
+    public function forReturn(?array $type, Imports $imports, ?array $domain = null): array
+    {
+        if ($type === null || ($type['kind'] === 'named' && in_array($type['name'], ['void', 'never', 'self', 'static'], true))) {
+            return [];
+        }
+        if ($this->isStubbable($type)) {
+            return $type['nullable'] ? [null, new Val('null')] : [];
+        }
+        // The generic baseline first: domain values are often failure checks (`=== false`) that end the
+        // method early, a poor baseline for the variations of the other inputs. Then the values the code
+        // compares the result with (or passes on to a method that does).
+        // Inline expressions only: a return value can't be hoisted into its own variable.
+        $generic = array_values(array_filter($this->candidates($type, $imports, depth: 1) ?? [], fn (Val $v) => !$v->hoist));
+        $vals = array_slice($generic, 0, 1);
+        foreach ([...$this->fromDomain($type, $domain, $imports), ...array_slice($generic, 1)] as $v) {
+            if (!$v->in($vals)) {
+                $vals[] = $v;
+            }
+        }
+        return $vals;
+    }
+
     /** @return list<Val> */
-    private static function fromDomain(?array $type, ?array $domain, Imports $imports): array
+    private function fromDomain(?array $type, ?array $domain, Imports $imports): array
     {
         $vals = [];
         foreach ($domain['values'] ?? [] as $item) {
@@ -109,8 +179,11 @@ final class Values
             && in_array($valueType, self::ACCEPTS[$type['name']] ?? [], true);
     }
 
-    /** @return list<Val>|null */
-    public static function candidates(?array $type, Imports $imports): ?array
+    /**
+     * @param int $depth 0 for arguments of the call under test; deeper values are built inline
+     * @return list<Val>|null
+     */
+    public function candidates(?array $type, Imports $imports, int $depth = 0): ?array
     {
         if ($type === null) {
             return self::literals(self::BUILTIN['mixed']);
@@ -118,7 +191,7 @@ final class Values
         if ($type['kind'] === 'union') {
             $vals = [];
             foreach ($type['types'] as $member) {
-                foreach (self::candidates($member, $imports) ?? [] as $v) {
+                foreach ($this->candidates($member, $imports, $depth) ?? [] as $v) {
                     if (!$v->in($vals)) {
                         $vals[] = $v;
                     }
@@ -132,7 +205,7 @@ final class Values
         if ($type['kind'] !== 'named') {
             return null; // intersection types: not supported yet
         }
-        $vals = self::named($type, $imports);
+        $vals = $this->named($type, $imports, $depth);
         if ($vals !== null && $type['nullable'] && !(new Val('null'))->in($vals)) {
             $vals[] = new Val('null');
         }
@@ -140,12 +213,13 @@ final class Values
     }
 
     /** @return list<Val>|null */
-    private static function named(array $type, Imports $imports): ?array
+    private function named(array $type, Imports $imports, int $depth): ?array
     {
         $name = $type['name'];
+        $hoist = $depth === 0;
         if ($type['builtin']) {
             if ($name === 'object') {
-                return [new Val('new ' . $imports->ref('stdClass') . '()', hoist: true)];
+                return [new Val('new ' . $imports->ref('stdClass') . '()', $hoist)];
             }
             return isset(self::BUILTIN[$name]) ? self::literals(self::BUILTIN[$name]) : null;
         }
@@ -157,11 +231,11 @@ final class Values
         }
         if (isset(self::DATE_CLASSES[$name])) {
             $cls = $imports->ref(self::DATE_CLASSES[$name]);
-            return [new Val("new $cls('2024-01-15 10:30:00')", hoist: true)];
+            return [new Val("new $cls('2024-01-15 10:30:00')", $hoist)];
         }
 
-        $info = $type['class'] ?? [];
-        if (!($info['exists'] ?? false)) {
+        $info = $this->type($name);
+        if ($info === null) {
             return null;
         }
         $alias = $imports->ref($name);
@@ -169,13 +243,83 @@ final class Values
             return array_map(fn (string $case) => new Val("$alias::$case"), $info['enumCases']) ?: null;
         }
         if (!$info['isFinal']) {
-            // PHPUnit stubs return type-appropriate defaults for every method.
-            return [new Val("\$this->createStub($alias::class)", hoist: true)];
+            // PHPUnit stubs; return values are configured by the case builder.
+            return [new Val("\$this->createStub($alias::class)", $hoist)];
         }
-        if (!$info['isAbstract'] && $info['requiredCtorParams'] === 0) {
-            return [new Val("new $alias()", hoist: true)];
+        $built = $this->build($info, $alias, $imports, $depth);
+        return $built === [] ? null : array_map(fn (string $expr) => new Val($expr, $hoist), $built);
+    }
+
+    /**
+     * `new X(args)` or `X::factory(args)` with baseline values for the required parameters, then
+     * variants setting one hinted optional parameter (named argument) to a non-default value.
+     *
+     * @return list<string> PHP expressions, baseline first; empty if the class can't be built
+     */
+    private function build(array $info, string $alias, Imports $imports, int $depth): array
+    {
+        if ($depth >= self::MAX_BUILD_DEPTH) {
+            return [];
         }
-        return null;
+        $ways = [];
+        if ($info['constructor'] !== null) {
+            $ways[] = ["new $alias", $info['constructor']];
+        }
+        foreach ($info['factories'] as $factory) {
+            $ways[] = ["$alias::{$factory['name']}", $factory['params']];
+        }
+        foreach ($ways as [$callee, $params]) {
+            $args = $this->baselineArgs($params, $imports, $depth + 1);
+            if ($args === null) {
+                continue;
+            }
+            $built = [$callee . '(' . implode(', ', $args) . ')'];
+            foreach ($params as $p) {
+                if (!$p['optional'] || $p['variadic'] || !in_array($p['name'], $this->hints, true)) {
+                    continue;
+                }
+                foreach ($this->candidates($p['type'], $imports, $depth + 1) ?? [] as $v) {
+                    if (count($built) > self::MAX_OBJECT_VARIANTS) {
+                        break 2;
+                    }
+                    if (!self::isDefault($v, $p['default'] ?? null)) {
+                        $built[] = $callee . '(' . implode(', ', [...$args, "{$p['name']}: {$v->expr}"]) . ')';
+                    }
+                }
+            }
+            return $built;
+        }
+        return [];
+    }
+
+    private static function isDefault(Val $v, ?array $default): bool
+    {
+        return match ($default['kind'] ?? null) {
+            'null' => $v->expr === 'null',
+            'scalar' => $v->expr === $default['expr'],
+            'enum' => str_ends_with($v->expr, '::' . $default['case']),
+            default => false,
+        };
+    }
+
+    /** @return list<string>|null */
+    private function baselineArgs(array $params, Imports $imports, int $depth): ?array
+    {
+        $args = [];
+        foreach ($params as $p) {
+            if ($p['optional'] || $p['variadic']) {
+                break;
+            }
+            if ($p['byRef']) {
+                return null;
+            }
+            $vals = $this->candidates($p['type'], $imports, $depth);
+            if (!$vals) {
+                return null;
+            }
+            $args[] = $vals[0]->expr;
+        }
+        return $args;
     }
 
     /** @return list<Val> */

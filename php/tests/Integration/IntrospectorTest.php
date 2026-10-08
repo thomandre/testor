@@ -42,7 +42,44 @@ final class IntrospectorTest extends DemoProjectTestCase
         $this->assertTrue($this->method('App\Identity\Email', 'from')['factory']);
 
         $tier = $this->method('App\Pricing\PriceCalculator', 'discountFor')['params'][0]['type'];
-        $this->assertSame(['Standard', 'Premium', 'Vip'], $tier['class']['enumCases']);
+        $this->assertSame(['Standard', 'Premium', 'Vip'], self::$data['types'][$tier['name']]['enumCases']);
+    }
+
+    public function testTypeRegistryDescribesDependenciesAndHowToBuildObjects(): void
+    {
+        $this->classes();
+        $types = self::$data['types'];
+
+        $this->assertSame('App\Orders\Order', $types['App\Orders\OrderRepository']['methods']['find']['returnType']['name']);
+        $this->assertSame(['id', 'amount', 'status'], array_column($types['App\Orders\Order']['constructor'], 'name'));
+        $this->assertSame([], $types['App\Orders\Order']['methods'], 'final classes are built, not stubbed');
+    }
+
+    public function testReturnValueDomainsFollowArgumentsIntoOtherClasses(): void
+    {
+        $domain = $this->method('App\Orders\CheckoutService', 'shippingLabel')['returnDomains']['property']['basket']['itemcount'];
+
+        $this->assertSame(['2', '3', '4'], array_column($domain['values'], 'expr'), 'from ShippingPolicy::isFree(): $items >= 3');
+    }
+
+    public function testDefaultsAndReadPropertiesForObjectVariants(): void
+    {
+        $this->classes();
+        $status = array_column(self::$data['types']['App\Orders\Order']['constructor'], null, 'name')['status'];
+
+        $this->assertSame(['kind' => 'enum', 'case' => 'Pending'], $status['default']);
+        $this->assertContains('status', $this->classes()['App\Orders\OrderService']['readProperties']);
+    }
+
+    public function testDependencyCallsAndConstructorPropertiesAreAttached(): void
+    {
+        $classes = $this->classes();
+
+        $this->assertSame(['orders' => 'orders', 'payments' => 'payments'], $classes['App\Orders\OrderService']['ctorProperties']);
+        $this->assertSame(
+            ['orders' => ['find'], 'payments' => ['charge', 'fee']],
+            $this->method('App\Orders\OrderService', 'pay')['calls']['property'],
+        );
     }
 
     public function testPublicConstantsAreResolvedWithTheirName(): void

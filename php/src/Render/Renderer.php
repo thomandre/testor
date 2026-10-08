@@ -34,6 +34,9 @@ final class Renderer
             }
             $used[$var] = true;
             $lines[] = "\$$var = {$arg->val->expr};";
+            foreach ($arg->val->returns as $method => $value) {
+                $lines[] = '$' . $var . "->method('$method')->willReturn($value);";
+            }
             return "\$$var";
         };
 

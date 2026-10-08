@@ -17,16 +17,30 @@ final class ValuesTest extends TestCase
     use Descriptors;
 
     private Imports $imports;
+    /** @var array<string, array> class registry */
+    private array $types = [];
 
     protected function setUp(): void
     {
         $this->imports = new Imports();
     }
 
+    /** Registers a class and returns its type descriptor. */
+    private function register(string $name, array $info = [], bool $nullable = false): array
+    {
+        $this->types[$name] = self::typeInfo($info);
+        return self::classType($name, $nullable);
+    }
+
+    private function values(): Values
+    {
+        return new Values($this->types);
+    }
+
     /** @return list<string>|null */
     private function exprs(?array $type, ?array $domain = null): ?array
     {
-        $vals = Values::forParam(self::param('p', $type, ['domain' => $domain]), $this->imports);
+        $vals = $this->values()->forParam(self::param('p', $type, ['domain' => $domain]), $this->imports);
         return $vals === null ? null : array_map(fn (Val $v) => $v->expr, $vals);
     }
 
@@ -57,7 +71,7 @@ final class ValuesTest extends TestCase
 
     public function testEnumGetsEveryCase(): void
     {
-        $type = self::classType('App\Tier', ['isEnum' => true, 'isFinal' => true, 'enumCases' => ['Gold', 'Silver']]);
+        $type = $this->register('App\Tier', ['isEnum' => true, 'isFinal' => true, 'enumCases' => ['Gold', 'Silver']]);
 
         $this->assertSame(['Tier::Gold', 'Tier::Silver'], $this->exprs($type));
         $this->assertSame(['use App\Tier;'], $this->imports->lines());
@@ -65,22 +79,63 @@ final class ValuesTest extends TestCase
 
     public function testInterfacesAndOpenClassesAreStubbed(): void
     {
-        $vals = Values::forParam(self::param('p', self::classType('App\Clock', ['isInterface' => true])), $this->imports);
+        $type = $this->register('App\Clock', ['isInterface' => true]);
 
-        $this->assertEquals([new Val('$this->createStub(Clock::class)', hoist: true)], $vals);
+        $this->assertEquals(
+            [new Val('$this->createStub(Clock::class)', hoist: true)],
+            $this->values()->forParam(self::param('p', $type), $this->imports),
+        );
+        $this->assertTrue($this->values()->isStubbable($type));
+        $this->assertFalse($this->values()->isStubbable(self::builtin('int')));
     }
 
-    public function testFinalClassIsInstantiatedOnlyWithoutRequiredArguments(): void
+    public function testFinalClassesAreBuiltWithBaselineArguments(): void
     {
-        $this->assertSame(['new Money()'], $this->exprs(self::classType('App\Money', ['isFinal' => true])));
-        $this->assertNull($this->exprs(self::classType('App\Id', ['isFinal' => true, 'requiredCtorParams' => 1])));
+        $money = $this->register('App\Money', ['isFinal' => true, 'constructor' => [
+            self::param('amount', self::builtin('int')),
+            self::param('currency', self::builtin('string'), ['optional' => true]),
+        ]]);
+
+        $this->assertSame(['new Money(1)'], $this->exprs($money), 'optional parameters keep their default');
     }
 
-    public function testUnsupportedTypes(): void
+    public function testFinalClassWithPrivateConstructorUsesAFactory(): void
     {
+        $email = $this->register('App\Email', ['isFinal' => true, 'factories' => [
+            ['name' => 'from', 'params' => [self::param('value', self::builtin('string'))]],
+        ]]);
+
+        $this->assertSame(["Email::from('testor')"], $this->exprs($email));
+    }
+
+    public function testNestedObjectsAreBuiltInlineUpToALimitedDepth(): void
+    {
+        $this->register('App\Id', ['isFinal' => true, 'constructor' => [self::param('v', self::builtin('int'))]]);
+        $this->register('App\Clock', ['isInterface' => true]);
+        $order = $this->register('App\Order', ['isFinal' => true, 'constructor' => [
+            self::param('id', self::classType('App\Id')),
+            self::param('clock', self::classType('App\Clock')),
+        ]]);
+        $this->assertSame(['new Order(new Id(1), $this->createStub(Clock::class))'], $this->exprs($order));
+
+        // L1 > L2 > L3 > L4 > L5: L5 would be built at depth 4, beyond the limit.
+        foreach (range(1, 5) as $i) {
+            $this->register("App\\L$i", ['isFinal' => true, 'constructor' => [
+                self::param('v', $i < 5 ? self::classType('App\\L' . ($i + 1)) : self::builtin('int')),
+            ]]);
+        }
+        $this->assertSame(['new L2(new L3(new L4(new L5(1))))'], $this->exprs(self::classType('App\L2')));
+        $this->assertNull($this->exprs(self::classType('App\L1')), 'too deep');
+    }
+
+    public function testUnbuildableTypes(): void
+    {
+        $this->register('App\Sealed', ['isFinal' => true]);
+
+        $this->assertNull($this->exprs(self::classType('App\Sealed')), 'no public constructor, no factory');
         $this->assertNull($this->exprs(['kind' => 'named', 'name' => 'self', 'builtin' => false, 'nullable' => false]));
         $this->assertNull($this->exprs(['kind' => 'intersection']));
-        $this->assertNull($this->exprs(self::classType('App\Missing', ['exists' => false])));
+        $this->assertNull($this->exprs(self::classType('App\Unknown')));
     }
 
     public function testDatesUseAFixedInstant(): void
@@ -89,6 +144,49 @@ final class ValuesTest extends TestCase
             ["new DateTimeImmutable('2024-01-15 10:30:00')"],
             $this->exprs(['kind' => 'named', 'name' => 'DateTimeInterface', 'builtin' => false, 'nullable' => false]),
         );
+    }
+
+    public function testReturnValuesForStubbedMethods(): void
+    {
+        $this->register('App\Order', ['isFinal' => true, 'constructor' => [self::param('id', self::builtin('int'))]]);
+        $this->register('App\Repo', ['isInterface' => true]);
+        $returns = fn (?array $type) => array_map(fn (?Val $v) => $v?->expr, $this->values()->forReturn($type, $this->imports));
+
+        $this->assertSame(['true', 'false'], $returns(self::builtin('bool')));
+        $this->assertSame(['new Order(1)', 'null'], $returns(self::classType('App\Order', nullable: true)));
+        $this->assertSame([null, 'null'], $returns(self::classType('App\Repo', nullable: true)), 'default stub, then null');
+        $this->assertSame([], $returns(self::classType('App\Repo')), 'PHPUnit default stub is enough');
+        $this->assertSame([], $returns(self::builtin('void')));
+        $this->assertSame([], $returns(null));
+    }
+
+    public function testStubReturnDomainValuesComeAfterTheGenericBaseline(): void
+    {
+        $domain = self::domain([self::literal('99', 'int'), self::literal('100', 'int'), self::literal("'x'", 'string')]);
+        $returns = array_map(fn (Val $v) => $v->expr, $this->values()->forReturn(self::builtin('int'), $this->imports, $domain));
+
+        $this->assertSame(['1', '99', '100', '0', '-1'], $returns);
+    }
+
+    public function testOptionalArgumentsReadByTheCodeUnderTestAreVaried(): void
+    {
+        $this->register('App\Status', ['isEnum' => true, 'isFinal' => true, 'enumCases' => ['Pending', 'Paid', 'Cancelled']]);
+        $order = $this->register('App\Order', ['isFinal' => true, 'constructor' => [
+            self::param('id', self::builtin('int')),
+            self::param('status', self::classType('App\Status'), ['optional' => true, 'default' => ['kind' => 'enum', 'case' => 'Pending']]),
+            self::param('note', self::builtin('string', nullable: true), ['optional' => true, 'default' => ['kind' => 'null']]),
+        ]]);
+
+        $this->assertSame(['new Order(1)'], $this->exprs($order), 'no hint: defaults only');
+
+        $vals = $this->values()->withHints(['status', 'note'])->forParam(self::param('p', $order), $this->imports);
+        $this->assertSame([
+            'new Order(1)',
+            'new Order(1, status: Status::Paid)',
+            'new Order(1, status: Status::Cancelled)',
+            "new Order(1, note: 'testor')",
+            "new Order(1, note: '')",
+        ], array_map(fn (Val $v) => $v->expr, $vals), 'default values are skipped, at most 4 variants');
     }
 
     public function testExhaustiveDomainOnlyUsesItsValues(): void

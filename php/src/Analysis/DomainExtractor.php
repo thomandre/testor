@@ -61,6 +61,82 @@ final class DomainExtractor
         return ['exhaustive' => false, 'source' => $doc !== null ? 'phpdoc+code' : 'code', 'values' => $values];
     }
 
+    /**
+     * Where the values returned by dependency calls go: compared with constants (directly, or through
+     * the local variable they are assigned to), or passed as an argument to another method.
+     *
+     * @return list<array{dep: array{string, string, string}, items?: list<array>, call?: array{string, string, int}}>
+     *         dep = [property|variable, name, lowercase method]; call = [class, lowercase method, argument index]
+     */
+    public function dependencyFlows(Stmt\ClassMethod $method): array
+    {
+        $stmts = $method->stmts ?? [];
+        $flows = [];
+        $nodes = $this->finder->find($stmts, fn (Node $n) => $n instanceof BinaryOp || $n instanceof Expr\Assign
+            || $n instanceof Expr\StaticCall || $n instanceof Expr\MethodCall);
+
+        foreach ($nodes as $node) {
+            if ($node instanceof BinaryOp) {
+                $relational = in_array($node::class, self::RELATIONAL, true);
+                if (!$relational && !in_array($node::class, self::EQUALITY, true)) {
+                    continue;
+                }
+                foreach ([[$node->left, $node->right], [$node->right, $node->left]] as [$side, $other]) {
+                    $dep = $this->dependencyCall($side);
+                    $items = $dep === null ? [] : $this->literal($other);
+                    if ($items !== []) {
+                        $flows[] = ['dep' => $dep, 'items' => $relational ? $this->boundaries($items) : $items];
+                    }
+                }
+            } elseif ($node instanceof Expr\Assign) {
+                $dep = $this->dependencyCall($node->expr);
+                if ($dep !== null && $node->var instanceof Expr\Variable && is_string($node->var->name)) {
+                    $items = $this->codeDomain($stmts, $node->var->name);
+                    if ($items !== []) {
+                        $flows[] = ['dep' => $dep, 'items' => $items];
+                    }
+                }
+            } elseif ($node->name instanceof Node\Identifier && !$node->isFirstClassCallable()) {
+                // Calls whose target we can analyse: Class::m(...) and $this->m(...).
+                $class = match (true) {
+                    $node instanceof Expr\StaticCall && $node->class instanceof Name => $this->resolveClass($node->class),
+                    $node instanceof Expr\MethodCall && $node->var instanceof Expr\Variable && $node->var->name === 'this' => $this->className,
+                    default => null,
+                };
+                if ($class === null) {
+                    continue;
+                }
+                foreach ($node->getArgs() as $i => $arg) {
+                    $dep = $this->dependencyCall($arg->value);
+                    if ($dep !== null && $arg->name === null) {
+                        $flows[] = ['dep' => $dep, 'call' => [$class, $node->name->toLowerString(), $i]];
+                    }
+                }
+            }
+        }
+        return $flows;
+    }
+
+    /** [property|variable, name, lowercase method] for `$this->prop->m()` / `$var->m()`, casts unwrapped. */
+    private function dependencyCall(Node $node): ?array
+    {
+        while ($node instanceof Expr\Cast) {
+            $node = $node->expr;
+        }
+        if (!($node instanceof Expr\MethodCall || $node instanceof Expr\NullsafeMethodCall) || !$node->name instanceof Node\Identifier) {
+            return null;
+        }
+        $target = $node->var;
+        if (($target instanceof Expr\PropertyFetch || $target instanceof Expr\NullsafePropertyFetch)
+            && $target->var instanceof Expr\Variable && $target->var->name === 'this' && $target->name instanceof Node\Identifier) {
+            return ['property', $target->name->toString(), $node->name->toLowerString()];
+        }
+        if ($target instanceof Expr\Variable && is_string($target->name) && $target->name !== 'this') {
+            return ['variable', $target->name, $node->name->toLowerString()];
+        }
+        return null;
+    }
+
     /** @param Node[] $stmts */
     private function codeDomain(array $stmts, string $param): array
     {

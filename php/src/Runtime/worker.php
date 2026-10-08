@@ -65,46 +65,82 @@ function classesInFile(string $file): array
     return $classes;
 }
 
-function describeClassRef(string $name): array
+/** Depth at which each referenced class must be described (0 = in a signature of a tested class). */
+$referenced = [];
+/** Classes deeper than this get only their kind flags (no constructor or factories). */
+const MAX_TYPE_DEPTH = 4;
+/** Methods (for stub return values) only matter for the direct dependencies of tested classes. */
+const MAX_METHODS_DEPTH = 1;
+
+function reference(string $name, int $depth): void
+{
+    global $referenced;
+    if (!isset($referenced[$name]) || $referenced[$name] > $depth) {
+        $referenced[$name] = $depth;
+    }
+}
+
+/**
+ * Registry entry for a class: kind flags, and below MAX_TYPE_DEPTH how to build it (public constructor,
+ * static factories) and, for stubbable types, the return type of each public method.
+ */
+function describeClass(string $name, int $depth): array
 {
     if (!class_exists($name) && !interface_exists($name) && !enum_exists($name)) {
         return ['exists' => false];
     }
     $ref = new ReflectionClass($name);
     $ctor = $ref->getConstructor();
-
-    return [
+    $info = [
         'exists' => true,
         'isInterface' => $ref->isInterface(),
         'isAbstract' => $ref->isAbstract(),
         'isFinal' => $ref->isFinal(),
         'isEnum' => $ref->isEnum(),
         'enumCases' => $ref->isEnum() ? array_map(fn ($c) => $c->name, $name::cases()) : [],
-        'requiredCtorParams' => $ctor ? $ctor->getNumberOfRequiredParameters() : 0,
+        'constructor' => null,
+        'factories' => [],
+        'methods' => [],
     ];
+    if ($depth >= MAX_TYPE_DEPTH || $ref->isEnum()) {
+        return $info;
+    }
+    if ($ref->isInstantiable() && (!$ctor || $ctor->isPublic())) {
+        $info['constructor'] = $ctor ? describeParams($ctor, $depth + 1) : [];
+    }
+    foreach ($ref->getMethods(ReflectionMethod::IS_PUBLIC) as $m) {
+        if ($m->isStatic() && !$ref->isAbstract() && returnsSelf($m, $ref)) {
+            $info['factories'][] = ['name' => $m->getName(), 'params' => describeParams($m, $depth + 1)];
+        } elseif (!$m->isStatic() && !$m->isConstructor() && !$ref->isFinal() && $depth < MAX_METHODS_DEPTH) {
+            $info['methods'][strtolower($m->getName())] = [
+                'name' => $m->getName(),
+                'returnType' => describeType($m->getReturnType(), $depth + 1),
+            ];
+        }
+    }
+    return $info;
 }
 
-function describeType(?ReflectionType $type): ?array
+function describeType(?ReflectionType $type, int $depth = 0): ?array
 {
     if ($type === null) {
         return null;
     }
     if ($type instanceof ReflectionNamedType) {
         $name = $type->getName();
-        $desc = [
+        if (!$type->isBuiltin() && !in_array($name, ['self', 'static', 'parent'], true)) {
+            reference($name, $depth);
+        }
+        return [
             'kind' => 'named',
             'name' => $name,
             'builtin' => $type->isBuiltin(),
             'nullable' => $type->allowsNull() && $name !== 'null' && $name !== 'mixed',
         ];
-        if (!$type->isBuiltin() && !in_array($name, ['self', 'static', 'parent'], true)) {
-            $desc['class'] = describeClassRef($name);
-        }
-        return $desc;
     }
     if ($type instanceof ReflectionUnionType) {
         $members = array_values(array_filter(
-            array_map('describeType', $type->getTypes()),
+            array_map(fn ($t) => describeType($t, $depth), $type->getTypes()),
             fn ($t) => !($t['kind'] === 'named' && $t['name'] === 'null'),
         ));
         return ['kind' => 'union', 'types' => $members, 'nullable' => $type->allowsNull()];
@@ -113,15 +149,35 @@ function describeType(?ReflectionType $type): ?array
     return ['kind' => 'intersection'];
 }
 
-function describeParams(ReflectionFunctionAbstract $fn): array
+function describeParams(ReflectionFunctionAbstract $fn, int $depth = 0): array
 {
     return array_map(fn (ReflectionParameter $p) => [
         'name' => $p->getName(),
-        'type' => describeType($p->getType()),
+        'type' => describeType($p->getType(), $depth),
         'optional' => $p->isOptional(),
         'variadic' => $p->isVariadic(),
         'byRef' => $p->isPassedByReference(),
+        'default' => describeDefault($p),
     ], $fn->getParameters());
+}
+
+/** Default value of an optional parameter: null, a scalar (as PHP code) or an enum case. */
+function describeDefault(ReflectionParameter $p): ?array
+{
+    try {
+        if (!$p->isDefaultValueAvailable()) {
+            return null;
+        }
+        $value = $p->getDefaultValue();
+    } catch (Throwable) {
+        return null;
+    }
+    return match (true) {
+        $value === null => ['kind' => 'null'],
+        $value instanceof UnitEnum => ['kind' => 'enum', 'case' => $value->name],
+        is_scalar($value) => ['kind' => 'scalar', 'expr' => is_bool($value) ? ($value ? 'true' : 'false') : var_export($value, true)],
+        default => null,
+    };
 }
 
 /** Files declaring the parent classes and traits (recursively) of a class, for static analysis. */
@@ -242,7 +298,38 @@ foreach ($request['files'] as $file) {
     }
 }
 
-foreach ($request['constants'] as $ref) {
+// Describe every referenced class, breadth first; a class seen again closer to the tested
+// classes is described again with more detail.
+$result['types'] = [];
+$describedAt = [];
+do {
+    $pending = array_filter($referenced, fn (int $depth, string $name) => ($describedAt[$name] ?? PHP_INT_MAX) > $depth, ARRAY_FILTER_USE_BOTH);
+    foreach ($pending as $name => $depth) {
+        $describedAt[$name] = $depth;
+        try {
+            $result['types'][$name] = describeClass($name, $depth);
+        } catch (Throwable) {
+            $result['types'][$name] = ['exists' => false];
+        }
+    }
+} while ($pending !== []);
+
+// Files declaring the requested classes (to analyse the methods tested code calls into).
+$result['files'] = [];
+foreach ($request['locate'] ?? [] as $name) {
+    try {
+        if (class_exists($name) || interface_exists($name) || trait_exists($name) || enum_exists($name)) {
+            $file = (new ReflectionClass($name))->getFileName();
+            if ($file !== false) {
+                $result['files'][$name] = $file;
+            }
+        }
+    } catch (Throwable) {
+        // not loadable: nothing to analyse
+    }
+}
+
+foreach ($request['constants'] ?? [] as $ref) {
     try {
         $result['constants'][$ref['class'] . '::' . $ref['name'] . '|' . (int) $ref['keys']] = resolveConstant($ref);
     } catch (Throwable) {

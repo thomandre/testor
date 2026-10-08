@@ -82,6 +82,37 @@ final class GeneratorTest extends DemoProjectTestCase
         $this->assertStringContainsString("\$sut = Email::from('testor');", $this->generated('App\Identity\Email'));
     }
 
+    public function testStubReturnValuesDriveTheBranchesOfDependentCode(): void
+    {
+        $source = $this->generated('App\Orders\OrderService');
+
+        $this->assertStringContainsString("\$orders->method('find')->willReturn(null);", $source);
+        $this->assertStringContainsString("\$this->expectExceptionMessage('Order 1 not found');", $source);
+        $this->assertStringContainsString("\$payments->method('charge')->willReturn(false);", $source);
+        $this->assertStringContainsString("\$this->assertSame('declined', \$sut->pay(1));", $source);
+        $this->assertStringContainsString("\$orders->method('find')->willReturn(new Order(1, 1.5));", $source);
+        if (\Testor\Runtime\Recorder::driver() !== null) {
+            $this->assertGreaterThanOrEqual(90.0, self::$reports['App\Orders\OrderService']->coverage());
+        }
+    }
+
+    public function testOptionalArgumentsAndCrossClassThresholds(): void
+    {
+        $this->assertStringContainsString(
+            "\$orders->method('find')->willReturn(new Order(1, 1.5, status: OrderStatus::Paid));",
+            $this->generated('App\Orders\OrderService'),
+        );
+        $this->assertStringContainsString("\$this->assertSame('already processed', \$sut->pay(1));", $this->generated('App\Orders\OrderService'));
+        $this->assertStringContainsString(
+            "\$basket->method('itemCount')->willReturn(3);",
+            $this->generated('App\Orders\CheckoutService'),
+            'threshold of ShippingPolicy::isFree()',
+        );
+        if (\Testor\Runtime\Recorder::driver() !== null) {
+            $this->assertSame(100.0, self::$reports['App\Orders\OrderService']->coverage());
+        }
+    }
+
     public function testMethodsWithSideEffectsAreSkipped(): void
     {
         $this->assertContains(['export', 'side effects: file_put_contents'], self::$reports['App\Io\CsvExporter']->skipped);

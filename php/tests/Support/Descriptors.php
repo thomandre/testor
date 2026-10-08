@@ -12,14 +12,17 @@ trait Descriptors
         return ['kind' => 'named', 'name' => $name, 'builtin' => true, 'nullable' => $nullable];
     }
 
-    private static function classType(string $name, array $info = [], bool $nullable = false): array
+    private static function classType(string $name, bool $nullable = false): array
+    {
+        return ['kind' => 'named', 'name' => $name, 'builtin' => false, 'nullable' => $nullable];
+    }
+
+    /** Registry entry for a class, as produced by the reflection worker. */
+    private static function typeInfo(array $info = []): array
     {
         return [
-            'kind' => 'named', 'name' => $name, 'builtin' => false, 'nullable' => $nullable,
-            'class' => [
-                'exists' => true, 'isInterface' => false, 'isAbstract' => false, 'isFinal' => false,
-                'isEnum' => false, 'enumCases' => [], 'requiredCtorParams' => 0, ...$info,
-            ],
+            'exists' => true, 'isInterface' => false, 'isAbstract' => false, 'isFinal' => false,
+            'isEnum' => false, 'enumCases' => [], 'constructor' => null, 'factories' => [], 'methods' => [], ...$info,
         ];
     }
 
@@ -36,14 +39,15 @@ trait Descriptors
 
     private static function method(string $name, array $params = [], array $extra = []): array
     {
-        return ['name' => $name, 'static' => false, 'params' => $params,
-            'returnType' => self::builtin('string'), 'factory' => false, 'sideEffects' => [], ...$extra];
+        return ['name' => $name, 'static' => false, 'params' => $params, 'returnType' => self::builtin('string'),
+            'factory' => false, 'sideEffects' => [], 'calls' => ['property' => [], 'variable' => []], ...$extra];
     }
 
     private static function classDescriptor(string $name, array $methods, ?array $constructor = []): array
     {
         return ['name' => $name, 'file' => '/src/' . $name . '.php', 'kind' => 'class',
-            'constructor' => $constructor, 'methods' => $methods, 'ancestorFiles' => []];
+            'constructor' => $constructor, 'methods' => $methods, 'ancestorFiles' => [],
+            'ctorProperties' => [], 'constructorCalls' => ['property' => [], 'variable' => []]];
     }
 
     /** @param list<array{expr: string, type: string}|array> $values */

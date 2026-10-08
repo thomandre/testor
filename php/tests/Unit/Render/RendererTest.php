@@ -54,6 +54,19 @@ final class RendererTest extends TestCase
         $this->assertSame('$sut->at($clock2, 1)', $call);
     }
 
+    public function testArrangeConfiguresStubReturnValues(): void
+    {
+        $stub = new Val('$this->createStub(Gateway::class)', hoist: true, returns: ['charge' => 'false', 'fee' => '1.5']);
+        $case = self::scenario('pay', [], new Construction(null, [new Arg('gateway', $stub)]));
+
+        $this->assertSame([[
+            '$gateway = $this->createStub(Gateway::class);',
+            "\$gateway->method('charge')->willReturn(false);",
+            "\$gateway->method('fee')->willReturn(1.5);",
+            '$sut = new Svc($gateway);',
+        ], '$sut->pay()'], $this->renderer->arrange($case, 'Svc'));
+    }
+
     public function testArrangeWithFactoryAndStaticCall(): void
     {
         $this->assertSame(
