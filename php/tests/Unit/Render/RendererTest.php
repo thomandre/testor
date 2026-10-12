@@ -67,6 +67,32 @@ final class RendererTest extends TestCase
         ], '$sut->pay()'], $this->renderer->arrange($case, 'Svc'));
     }
 
+    public function testArrangeConfiguresThrowingStubs(): void
+    {
+        $stub = new Val('$this->createStub(Basket::class)', hoist: true, throws: ['count' => "new RuntimeException('testor')"]);
+
+        [$lines] = $this->renderer->arrange(self::scenario('items', [], new Construction(null, [new Arg('basket', $stub)])), 'Svc');
+
+        $this->assertContains("\$basket->method('count')->willThrowException(new RuntimeException('testor'));", $lines);
+    }
+
+    public function testTestNamesDescribeWhatDiffersFromTheBaseline(): void
+    {
+        $case = new Scenario('c1', self::method('pay'), new Construction(null, []), [], [0, 2],
+            ['WhenFindReturnsNull', 'WhenChargeReturnsFalse', 'WithAmountMinus1']);
+        $class = self::classDescriptor('App\Svc', []);
+
+        [, $names] = $this->renderer->final($class, [
+            [$case, ['kind' => 'value', 'export' => "'declined'", 'type' => 'string']],
+            [$case, ['kind' => 'value', 'export' => "'a very long string that cannot name a test'", 'type' => 'string']],
+        ], new Imports(), 'Tests');
+
+        $this->assertSame([
+            'testPayReturnsDeclinedWhenFindReturnsNullAndWhenChargeReturnsFalse',
+            'testPayReturnsStringWhenFindReturnsNullAndWhenChargeReturnsFalse',
+        ], $names, 'at most two variations');
+    }
+
     public function testArrangeWithFactoryAndStaticCall(): void
     {
         $this->assertSame(
@@ -92,7 +118,7 @@ final class RendererTest extends TestCase
         [$source, $names] = $this->renderer->final($class, $cases, new Imports(), 'Tests\Testor\App');
 
         $this->assertSame([
-            'testAddReturnsInt', 'testAddReturnsInt2', 'testIsEvenReturnsTrue', 'testDivideThrowsDivisionByZeroError',
+            'testAddReturns3', 'testAddReturns4', 'testIsEvenReturnsTrue', 'testDivideThrowsDivisionByZeroError',
             'testResetSucceeds', 'testNowReturnsDateTimeImmutable', 'testRowsReturnsArray',
         ], $names);
         $this->assertStringContainsString("namespace Tests\\Testor\\App;\n", $source);

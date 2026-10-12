@@ -89,6 +89,7 @@ final class Introspector
                 $info = $methods[strtolower($method['name'])] ?? $none;
                 $method['sideEffects'] = $info['sideEffects'];
                 $method['calls'] = $info['calls'];
+                $method['catches'] = $info['catches'] ?? [];
                 foreach ($method['params'] as &$param) {
                     $param['domain'] = $this->resolve($info['domains'][$param['name']] ?? null, $constants);
                 }

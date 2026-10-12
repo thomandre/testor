@@ -7,4 +7,6 @@ namespace App\Orders;
 interface Basket
 {
     public function itemCount(): int;
+
+    public function reserve(): bool;
 }

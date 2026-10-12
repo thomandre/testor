@@ -137,12 +137,20 @@ final class DomainExtractor
         return null;
     }
 
-    /** @param Node[] $stmts */
-    private function codeDomain(array $stmts, string $param): array
+    /**
+     * Domain of a value (a variable, or a property with propertyDomain()) from how the code uses it:
+     * comparisons, in_array/array_key_exists, match/switch arms, length checks, and functions that
+     * expect a given format (filter_var, preg_match, json_decode, strtotime, explode…).
+     *
+     * @param Node[] $stmts
+     * @param string|callable(Node): bool $target variable name, or a matcher
+     */
+    private function codeDomain(array $stmts, string|callable $target): array
     {
+        $is = is_string($target) ? fn (Node $n) => $n instanceof Expr\Variable && $n->name === $target : $target;
         $items = [];
-        $nodes = $this->finder->find($stmts, fn (Node $n) => $n instanceof BinaryOp
-            || $n instanceof Expr\FuncCall || $n instanceof Expr\Match_ || $n instanceof Stmt\Switch_);
+        $nodes = $this->finder->find($stmts, fn (Node $n) => $n instanceof BinaryOp || $n instanceof Expr\FuncCall
+            || $n instanceof Expr\New_ || $n instanceof Expr\Match_ || $n instanceof Stmt\Switch_);
 
         foreach ($nodes as $node) {
             if ($node instanceof BinaryOp) {
@@ -150,29 +158,32 @@ final class DomainExtractor
                 if (!$relational && !in_array($node::class, self::EQUALITY, true)) {
                     continue;
                 }
-                $other = match (true) {
-                    $this->isParam($node->left, $param) => $node->right,
-                    $this->isParam($node->right, $param) => $node->left,
-                    default => null,
-                };
-                if ($other !== null) {
-                    $found = $this->literal($other);
-                    array_push($items, ...($relational ? $this->boundaries($found) : $found));
+                foreach ([[$node->left, $node->right], [$node->right, $node->left]] as [$side, $other]) {
+                    if ($is($side)) {
+                        $found = $this->literal($other);
+                        array_push($items, ...($relational ? $this->boundaries($found) : $found));
+                    } elseif (($measure = $this->measured($side, $is)) !== null) {
+                        // strlen($p) > 10, count($p) >= 3: values of the boundary lengths.
+                        array_push($items, ...$this->sized($measure, $this->literal($other), $relational));
+                    }
                 }
             } elseif ($node instanceof Expr\FuncCall && $node->name instanceof Name && !$node->isFirstClassCallable()) {
                 $fn = $node->name->toLowerString();
                 $args = $node->getArgs();
-                if (in_array($fn, ['in_array', 'array_key_exists'], true) && count($args) >= 2
-                    && $this->isParam($args[0]->value, $param)) {
+                if (in_array($fn, ['in_array', 'array_key_exists'], true) && count($args) >= 2 && $is($args[0]->value)) {
                     array_push($items, ...$this->arrayItems($args[1]->value, keys: $fn === 'array_key_exists'));
+                } else {
+                    array_push($items, ...Usage::forFunction($fn, $args, $is));
                 }
-            } elseif ($node instanceof Expr\Match_ && $this->mentions($node->cond, $param)) {
+            } elseif ($node instanceof Expr\New_ && $node->class instanceof Name && !$node->isFirstClassCallable()) {
+                array_push($items, ...Usage::forConstructor($node->class->toLowerString(), $node->getArgs(), $is));
+            } elseif ($node instanceof Expr\Match_ && $this->mentions($node->cond, $is)) {
                 foreach ($node->arms as $arm) {
                     foreach ($arm->conds ?? [] as $cond) {
                         array_push($items, ...$this->literal($cond));
                     }
                 }
-            } elseif ($node instanceof Stmt\Switch_ && $this->mentions($node->cond, $param)) {
+            } elseif ($node instanceof Stmt\Switch_ && $this->mentions($node->cond, $is)) {
                 foreach ($node->cases as $case) {
                     if ($case->cond !== null) {
                         array_push($items, ...$this->literal($case->cond));
@@ -183,15 +194,56 @@ final class DomainExtractor
         return $items;
     }
 
-    private function isParam(Node $node, string $param): bool
+    /**
+     * Domain of a property from how the class uses it (filter_var($this->email, …)), for the
+     * constructor or factory parameter it is built from.
+     */
+    public function propertyDomain(Stmt\ClassLike $class, string $property): array
     {
-        return $node instanceof Expr\Variable && $node->name === $param;
+        $is = fn (Node $n) => ($n instanceof Expr\PropertyFetch || $n instanceof Expr\NullsafePropertyFetch)
+            && $n->var instanceof Expr\Variable && $n->var->name === 'this'
+            && $n->name instanceof Node\Identifier && $n->name->toString() === $property;
+        return $this->codeDomain($class->stmts, $is);
     }
 
-    private function mentions(Node $node, string $param): bool
+    /** 'string' for strlen($p)/mb_strlen($p), 'array' for count($p), else null. */
+    private function measured(Node $node, callable $is): ?string
     {
-        return $this->isParam($node, $param)
-            || $this->finder->findFirst($node, fn (Node $n) => $this->isParam($n, $param)) !== null;
+        if (!$node instanceof Expr\FuncCall || !$node->name instanceof Name || $node->isFirstClassCallable()) {
+            return null;
+        }
+        $args = $node->getArgs();
+        if ($args === [] || !$is($args[0]->value)) {
+            return null;
+        }
+        return match ($node->name->toLowerString()) {
+            'strlen', 'mb_strlen', 'iconv_strlen', 'grapheme_strlen' => 'string',
+            'count', 'sizeof' => 'array',
+            default => null,
+        };
+    }
+
+    /** Strings or arrays of the compared length (and n-1, n+1 for relational comparisons). */
+    private function sized(string $kind, array $lengths, bool $relational): array
+    {
+        $items = [];
+        foreach ($lengths as $length) {
+            if (($length['type'] ?? null) !== 'int') {
+                continue;
+            }
+            $n = (int) $length['expr'];
+            foreach ($relational ? [$n - 1, $n, $n + 1] : [$n] as $k) {
+                if ($k >= 0 && $k <= 10_000) {
+                    $items[] = $kind === 'string' ? Usage::stringOfLength($k) : Usage::arrayOfSize($k);
+                }
+            }
+        }
+        return $items;
+    }
+
+    private function mentions(Node $node, callable $is): bool
+    {
+        return $is($node) || $this->finder->findFirst($node, $is) !== null;
     }
 
     /** Domain items for a literal expression (string, number, true/false/null, Class::CONST). */

@@ -34,6 +34,7 @@ final class Generator
         private readonly bool $allowSideEffects = false,
         private readonly bool $verbose = false,
         private readonly string $select = 'both',
+        private readonly int $searchRounds = 3,
     ) {
         if (!in_array($select, ['outcome', 'coverage', 'both'], true)) {
             throw new \InvalidArgumentException("Unknown selection strategy: $select");
@@ -79,8 +80,13 @@ final class Generator
             return $report;
         }
 
-        // 1. Recording pass: observe what the code actually does for each input (and the lines it runs).
+        // 1. Recording pass: observe what the code actually does for each input (and the lines it runs),
+        //    then coverage-guided search around the cases that reached the most lines.
         [$records, $output] = $this->record($class, $cases, $imports);
+        if (isset($records['executable'])) {
+            [$cases, $records] = $this->search($class, $builder, $cases, $records, $imports);
+            $report->explored = count($cases);
+        }
         $outcomes = $records['cases'] ?? [];
         if ($outcomes === []) {
             $report->error = "recording pass produced nothing:\n" . substr($output, -2000);
@@ -174,6 +180,71 @@ final class Generator
         } finally {
             Process::removeDir($tmp);
         }
+    }
+
+    /**
+     * Coverage-guided search: for each method still gaining lines, take the case that covered the most
+     * lines (not used as a center yet) as the new baseline, record the cases varying one input at a time
+     * around it, and repeat. Combines inputs the first round only varied separately.
+     *
+     * @param list<Scenario> $cases
+     * @return array{list<Scenario>, array} all cases and merged records
+     */
+    private function search(array $class, CaseBuilder $builder, array $cases, array $records, Imports $imports): array
+    {
+        $centers = [];
+        $gaining = null; // methods whose coverage grew in the last round (null: all)
+        for ($round = 0; $round < $this->searchRounds; $round++) {
+            $byMethod = [];
+            foreach ($cases as $case) {
+                $outcome = $records['cases'][$case->id] ?? null;
+                if ($outcome !== null && !$this->isNoise($outcome)) {
+                    $byMethod[$case->method['name']][] = [$case, self::lineKeys($outcome['covered'] ?? [])];
+                }
+            }
+
+            $new = [];
+            $coveredBefore = [];
+            foreach ($byMethod as $method => $entries) {
+                $coveredBefore[$method] = array_flip(array_merge([], ...array_column($entries, 1)));
+                if ($gaining !== null && !isset($gaining[$method])) {
+                    continue;
+                }
+                usort($entries, fn (array $a, array $b) => count($b[1]) <=> count($a[1]));
+                foreach ($entries as [$case]) {
+                    $key = $method . ':' . implode(',', $case->choice);
+                    if (!isset($centers[$key])) {
+                        $centers[$key] = true;
+                        array_push($new, ...$builder->explore($case));
+                        break;
+                    }
+                }
+            }
+            if ($new === []) {
+                break;
+            }
+
+            [$more] = $this->record($class, $new, $imports);
+            $records['cases'] = [...$records['cases'], ...$more['cases'] ?? []];
+            $records['executable'] = array_replace($records['executable'], $more['executable'] ?? []);
+            $cases = [...$cases, ...$new];
+
+            $gaining = [];
+            foreach ($new as $case) {
+                $outcome = $more['cases'][$case->id] ?? null;
+                if ($outcome === null || $this->isNoise($outcome)) {
+                    continue;
+                }
+                $method = $case->method['name'];
+                if (array_diff_key(array_flip(self::lineKeys($outcome['covered'] ?? [])), $coveredBefore[$method] ?? []) !== []) {
+                    $gaining[$method] = true;
+                }
+            }
+            if ($gaining === []) {
+                break;
+            }
+        }
+        return [$cases, $records];
     }
 
     /** Candidates present in any of the selections, in their original order. */

@@ -37,12 +37,12 @@ final class CaseBuilderTest extends TestCase
         return self::classType($name);
     }
 
-    /** @return list<array<string, string>> the stub configuration of argument $i in each scenario */
-    private static function returns(array $scenarios, string $arg): array
+    /** @return list<array<string, string>> the stub configuration of an argument in each scenario */
+    private static function returns(array $scenarios, string $arg, string $what = 'returns'): array
     {
-        return array_map(function (Scenario $s) use ($arg) {
+        return array_map(function (Scenario $s) use ($arg, $what) {
             $all = [...$s->construction?->args ?? [], ...$s->args];
-            return array_values(array_filter($all, fn (Arg $a) => $a->name === $arg))[0]->val->returns;
+            return array_values(array_filter($all, fn (Arg $a) => $a->name === $arg))[0]->val->{$what};
         }, $scenarios);
     }
 
@@ -150,7 +150,46 @@ final class CaseBuilderTest extends TestCase
             ['charge' => 'true', 'fee' => '0.0'],
             ['charge' => 'true', 'fee' => '-2.5'],
         ], self::returns($pay, 'gateway'), 'void methods are not configured');
+        $this->assertSame(['WhenChargeReturnsFalse'], $pay[1]->variations);
         $this->assertSame([[]], self::returns($name, 'gateway'), 'methods not calling the dependency leave it unconfigured');
+    }
+
+    public function testDependenciesThrowWhenTheTestedMethodCatches(): void
+    {
+        $basket = $this->dependency('App\Basket', ['count' => self::builtin('int'), 'clear' => self::builtin('void')]);
+        $class = self::classDescriptor('App\Svc', [self::method('items', extra: [
+            'calls' => ['property' => ['basket' => ['count', 'clear']], 'variable' => []],
+            'catches' => ['Throwable'],
+        ])], [self::param('basket', $basket)]);
+        $class['ctorProperties'] = ['basket' => 'basket'];
+
+        [$scenarios] = $this->build($class);
+        $throwing = array_values(array_filter(self::returns($scenarios, 'basket', 'throws')));
+
+        $this->assertSame([
+            ['count' => "new RuntimeException('testor')"],
+            ['clear' => "new RuntimeException('testor')"],
+        ], $throwing, 'Throwable is caught: a RuntimeException is thrown, also by void methods');
+        $this->assertContains(['WhenCountThrows'], array_map(fn (Scenario $s) => $s->variations, $scenarios));
+    }
+
+    public function testExploreVariesEachDimensionAroundAnotherScenario(): void
+    {
+        $gateway = $this->dependency('App\Gateway', ['charge' => self::builtin('bool'), 'mode' => self::builtin('bool')]);
+        $class = self::classDescriptor('App\Svc', [
+            self::method('pay', extra: ['calls' => ['property' => ['gateway' => ['charge', 'mode']], 'variable' => []]]),
+        ], [self::param('gateway', $gateway)]);
+        $class['ctorProperties'] = ['gateway' => 'gateway'];
+        $builder = new CaseBuilder(20, values: new Values($this->types));
+
+        [$first] = $builder->build($class, new Imports());
+        $this->assertSame([[0, 0, 0], [0, 1, 0], [0, 0, 1]], array_map(fn (Scenario $s) => $s->choice, $first));
+
+        $around = $builder->explore($first[1]); // charge => false
+        $this->assertSame([[0, 1, 1]], array_map(fn (Scenario $s) => $s->choice, $around), 'already tried choices are skipped');
+        $this->assertSame(['charge' => 'false', 'mode' => 'false'], self::returns($around, 'gateway')[0]);
+        $this->assertSame(['WhenChargeReturnsFalse', 'WhenModeReturnsFalse'], $around[0]->variations);
+        $this->assertSame([], $builder->explore($first[1]), 'nothing new around the same center');
     }
 
     public function testMethodsCalledByTheConstructorAreConfiguredInEveryScenario(): void

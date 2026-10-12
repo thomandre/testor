@@ -113,6 +113,45 @@ final class GeneratorTest extends DemoProjectTestCase
         }
     }
 
+    public function testValuesInferredFromUsageAndDescriptiveNames(): void
+    {
+        $email = $this->generated('App\Identity\Email');
+
+        $this->assertStringContainsString("public function testDomainReturnsExampleCom(): void", $email);
+        $this->assertStringContainsString("\$sut = Email::from('user@example.com');", $email);
+        $this->assertStringContainsString('public function testIsValidReturnsFalseWithValueTestor(): void', $email);
+        $this->assertStringContainsString(
+            'public function testPayThrowsDomainExceptionWhenFindReturnsNull(): void',
+            $this->generated('App\Orders\OrderService'),
+        );
+    }
+
+    public function testDependencyExceptionsCoverCatchBlocks(): void
+    {
+        $this->assertStringContainsString(
+            "\$basket->method('itemCount')->willThrowException(new RuntimeException('testor'));",
+            $this->generated('App\Orders\CheckoutService'),
+        );
+        $this->assertStringContainsString('public function testItemsOrZeroReturns0WhenItemCountThrows(): void', $this->generated('App\Orders\CheckoutService'));
+    }
+
+    public function testSearchCombinesInputsTheFirstRoundOnlyVariedSeparately(): void
+    {
+        if (\Testor\Runtime\Recorder::driver() === null) {
+            $this->markTestSkipped('the search needs PCOV or Xdebug (coverage mode)');
+        }
+        // 'Out of stock' needs itemCount() >= 5 *and* reserve() returning false.
+        $this->assertStringContainsString("\$this->assertSame('Out of stock', \$sut->reserve());", $this->generated('App\Orders\CheckoutService'));
+
+        $out = Process::tempDir();
+        try {
+            [$report] = (new Generator(self::demo(), $out, searchRounds: 0))->generate([self::demo() . '/src/Orders/CheckoutService.php']);
+            $this->assertStringNotContainsString("'Out of stock'", (string) file_get_contents((string) $report->output));
+        } finally {
+            Process::removeDir($out);
+        }
+    }
+
     public function testMethodsWithSideEffectsAreSkipped(): void
     {
         $this->assertContains(['export', 'side effects: file_put_contents'], self::$reports['App\Io\CsvExporter']->skipped);

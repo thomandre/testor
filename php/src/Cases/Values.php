@@ -35,8 +35,8 @@ final class Values
     /** Which recorded value types each declared builtin type accepts (strict_types on). */
     private const ACCEPTS = [
         'string' => ['string'], 'int' => ['int'], 'float' => ['int', 'float'], 'bool' => ['bool'],
-        'true' => ['bool'], 'false' => ['bool'], 'null' => ['null'],
-        'mixed' => ['string', 'int', 'float', 'bool', 'null'],
+        'true' => ['bool'], 'false' => ['bool'], 'null' => ['null'], 'array' => ['array'], 'iterable' => ['array'],
+        'mixed' => ['string', 'int', 'float', 'bool', 'null', 'array'],
     ];
 
     /** Objects are built from their constructor or factory arguments, recursively up to this depth. */

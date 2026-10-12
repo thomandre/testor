@@ -27,6 +27,7 @@ use PhpParser\ParserFactory;
  *         'paramNames' => list<string>,
  *         'calls' => ['property' => [property => list<method>], 'variable' => [variable => list<method>]],
  *         'flows' => where dependency return values go (see DomainExtractor::dependencyFlows()),
+ *         'catches' => exception classes caught (by the method or the class's methods it calls),
  *     ]],
  *     'readProperties' => names of properties read on other objects,
  * ]]
@@ -121,8 +122,26 @@ final class SourceAnalyzer
                 $methods[$method->name->toLowerString()] = ['effects' => $effects, 'calls' => $calls,
                     'domains' => $paramDomains, 'paramNames' => array_keys($paramDomains)];
             }
+            // How the class uses a property set from a constructor parameter tells the parameter's domain;
+            // it applies to static factories' parameters of the same name too (Email::from($value)).
+            $ctorProperties = $this->ctorProperties($class);
+            foreach ($ctorProperties as $param => $property) {
+                $usage = $domains->propertyDomain($class, $property);
+                if ($usage === []) {
+                    continue;
+                }
+                foreach ($class->getMethods() as $method) {
+                    $lower = $method->name->toLowerString();
+                    if (($lower === '__construct' || $method->isStatic()) && array_key_exists($param, $methods[$lower]['domains'])) {
+                        $domain = $methods[$lower]['domains'][$param];
+                        $methods[$lower]['domains'][$param] = $domain === null
+                            ? ['exhaustive' => false, 'source' => 'property', 'values' => $usage]
+                            : ($domain['exhaustive'] ? $domain : [...$domain, 'values' => [...$domain['values'], ...$usage]]);
+                    }
+                }
+            }
             $this->raw[$name] = ['parent' => $parent, 'traits' => $traits, 'isTrait' => $class instanceof Stmt\Trait_,
-                'methods' => $methods, 'ctorProperties' => $this->ctorProperties($class),
+                'methods' => $methods, 'ctorProperties' => $ctorProperties,
                 'readProperties' => $this->readProperties($class)];
         } catch (\Throwable $e) {
             // Degrade gracefully: no domains/side effects for this class.
@@ -167,11 +186,14 @@ final class SourceAnalyzer
             $sideEffects = [];
             $calls = ['property' => [], 'variable' => []];
             $flows = [];
+            $catches = [];
             foreach (array_unique($effects[$origin]) as $effect) {
                 if (preg_match('/^call:(property|variable):(\w+)->(\w+)$/', $effect, $m)) {
                     $calls[$m[1]][$m[2]][] = $m[3];
                 } elseif (str_starts_with($effect, 'flow:')) {
                     $flows[] = json_decode(substr($effect, 5), true);
+                } elseif (str_starts_with($effect, 'catch:')) {
+                    $catches[] = substr($effect, 6);
                 } else {
                     $sideEffects[] = $effect;
                 }
@@ -182,6 +204,7 @@ final class SourceAnalyzer
                 'paramNames' => $this->rawMethod($origin)['paramNames'] ?? [],
                 'calls' => $calls,
                 'flows' => $flows,
+                'catches' => $catches,
             ];
         }
 
@@ -282,7 +305,14 @@ final class SourceAnalyzer
         $effects = [];
         $internal = [];
         foreach ((new NodeFinder())->find($stmts, fn () => true) as $node) {
-            if ($node instanceof Expr\Exit_) {
+            if ($node instanceof Stmt\TryCatch) {
+                // Recorded like effects so callers through $this->x() inherit them too.
+                foreach ($node->catches as $catch) {
+                    foreach ($catch->types as $type) {
+                        $effects[] = 'catch:' . $type->toString();
+                    }
+                }
+            } elseif ($node instanceof Expr\Exit_) {
                 $effects[] = 'exit';
             } elseif ($node instanceof Expr\FuncCall && $node->name instanceof Name) {
                 $fn = $node->name->toLowerString();

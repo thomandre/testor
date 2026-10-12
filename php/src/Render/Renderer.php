@@ -6,6 +6,7 @@ namespace Testor\Render;
 
 use Testor\Cases\Arg;
 use Testor\Cases\Imports;
+use Testor\Cases\Labels;
 use Testor\Cases\Scenario;
 
 /** Renders PHPUnit test files: a throwaway recording file and the final test file. */
@@ -36,6 +37,9 @@ final class Renderer
             $lines[] = "\$$var = {$arg->val->expr};";
             foreach ($arg->val->returns as $method => $value) {
                 $lines[] = '$' . $var . "->method('$method')->willReturn($value);";
+            }
+            foreach ($arg->val->throws as $method => $exception) {
+                $lines[] = '$' . $var . "->method('$method')->willThrowException($exception);";
             }
             return "\$$var";
         };
@@ -103,7 +107,8 @@ final class Renderer
             [$setup, $call] = $this->arrange($case, $sut);
             $returnsVoid = ($case->method['returnType']['name'] ?? null) === 'void';
             [$suffix, $act] = $this->assertion($outcome, $call, $returnsVoid, $imports);
-            $base = 'test' . ucfirst($case->method['name']) . $suffix;
+            // What differs from the baseline call, e.g. "WhenFindReturnsNull" (at most two parts).
+            $base = 'test' . ucfirst($case->method['name']) . $suffix . implode('And', array_slice($case->variations, 0, 2));
             $name = $base;
             for ($n = 2; in_array($name, $names, true); $n++) {
                 $name = $base . $n;
@@ -143,7 +148,10 @@ final class Renderer
                 if (in_array($export, ['true', 'false', 'null'], true)) {
                     return ['Returns' . ucfirst($export), ['$this->assert' . ucfirst($export) . "($call);"]];
                 }
-                return ['Returns' . ucfirst(Imports::short($outcome['type'])), ["\$this->assertSame($export, $call);"]];
+                // Short values name the test ("ReturnsDeclined"), others their type ("ReturnsArray").
+                $label = Labels::value(str_replace('\\', '', $export));
+                $label = $label !== '' && !str_starts_with($label, 'Array') ? $label : ucfirst(Imports::short($outcome['type']));
+                return ['Returns' . $label, ["\$this->assertSame($export, $call);"]];
             case 'nan':
                 return ['ReturnsNan', ["\$this->assertNan($call);"]];
             case 'array':

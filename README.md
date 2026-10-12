@@ -56,11 +56,25 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
      code under test reads (`$order->status`) are varied with named arguments
      (`new Order(1, 1.5, status: OrderStatus::Paid)`); the others keep their default.
 
+   - **Values inferred from usage:** how the code uses a parameter, or the property it is stored in, tells
+     its format: `filter_var(…, FILTER_VALIDATE_EMAIL)` gives an e-mail address, `preg_match('/^[A-Z]{2}\d+$/', …)`
+     gives a matching string (generated, then checked with `preg_match`), and so on for `json_decode`,
+     `strtotime`/`new DateTime`, `explode`, `str_starts_with`, `ctype_*`… `strlen($x) > 10` and `count($x) >= 3`
+     give the boundary lengths.
+   - **Exceptions from dependencies:** when the tested method catches exceptions, each called dependency
+     method also gets a `->willThrowException(…)` option, to cover the `catch` blocks.
+
    On the demo, `OrderService` goes from 56 % to 100 % line coverage. On 7 phpMyAdmin classes with injected
    dependencies, covered lines go from 30 to 100 (`AccountLocking`: 33 % → 89 %).
-4. **Recording:** a temporary test file runs every case, and `Runtime/Recorder.php` captures the outcome
+4. **Coverage-guided search** (`--search-rounds=N`, default 3): the first round varies one input at a time.
+   Each further round takes, for each method still gaining lines, the case that covered the most lines
+   as a new baseline and varies one input at a time around it. This combines inputs: `AccountLocking`
+   needs `isMariaDB()` → `false` *and* `getVersion()` → `50706`, which no single variation reaches
+   (89 % → 100 %). On phpMyAdmin (16 classes), line coverage goes from 61.3 % to 64.0 % with the inferred
+   values, then to 66.1 % with the search, for about 1.5 s more.
+5. **Recording:** a temporary test file runs every case, and `Runtime/Recorder.php` captures the outcome
    (value, exception, object…, or PHP warnings).
-5. **Selection:** discarded cases are the `TypeError` results caused by testor's own inputs and the cases
+6. **Selection:** discarded cases are the `TypeError` results caused by testor's own inputs and the cases
    that raise warnings, notices or deprecations. Among the remaining cases, a case is kept if:
    - `both` (default): it produces a new outcome for its method **or** it covers new lines;
    - `outcome`: it produces a new (method, outcome) pair;
@@ -70,11 +84,15 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
    (60.6 %) and `both` keeps 232 tests (60.9 %). Different inputs can return the same value through different
    branches, and different values can come from a single line (`return $a ? 'x' : 'y';`): each strategy
    misses what the other one catches.
-6. **Gate:** tests that fail or raise warnings (read from PHPUnit's event log) are removed.
+7. **Gate:** tests that fail or raise warnings (read from PHPUnit's event log) are removed.
    PHPUnit always runs with `--no-coverage --no-logging`, so the project's own coverage reports and logs
    are never produced (they are slow, and they would write into the project).
    Two consecutive clean runs are required. Generated classes use `#[BackupGlobals]` and
    `#[BackupStaticProperties]` so results don't depend on test order.
+
+Test names say what the test checks and which input differs from the baseline call:
+`testPayThrowsDomainExceptionWhenFindReturnsNull`, `testGradeReturnsAWithScore90`,
+`testItemsOrZeroReturns0WhenItemCountThrows`.
 
 These are **characterization tests**: they protect against regressions, but they cannot tell
 whether the current behaviour is correct.

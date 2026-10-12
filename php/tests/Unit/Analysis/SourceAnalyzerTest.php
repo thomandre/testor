@@ -143,6 +143,60 @@ final class SourceAnalyzerTest extends TestCase
         $this->assertNull($this->domainOf('$f = in_array(...); return $f($p, []);'));
     }
 
+    /** @return iterable<string, array{string, string, list<string>}> */
+    public static function usages(): iterable
+    {
+        yield 'filter_var e-mail' => ['return filter_var($p, FILTER_VALIDATE_EMAIL) !== false;', 'string $p', ["'user@example.com'"]];
+        yield 'preg_match' => ["return preg_match('/^[A-Z]{2}\\d{3}$/', \$p) === 1;", 'string $p', ["'AA111'"]];
+        yield 'json_decode' => ['return json_decode($p, true);', 'string $p', ["'{\"key\":\"value\"}'", "'[1,2,3]'"]];
+        yield 'explode' => ["return explode(';', \$p);", 'string $p', ["'a;b;c'"]];
+        yield 'str_starts_with' => ["return str_starts_with(\$p, 'SKU-');", 'string $p', ["'SKU-testor'"]];
+        yield 'date' => ['return new \\DateTimeImmutable($p);', 'string $p', ["'2024-01-15 10:30:00'"]];
+        yield 'string length' => ['return strlen($p) > 3;', 'string $p', ["'aa'", "'aaa'", "'aaaa'"]];
+        yield 'array size' => ['return count($p) === 2;', 'array $p', ['[1, 1]']];
+    }
+
+    /** @param list<string> $expected */
+    #[DataProvider('usages')]
+    public function testValuesInferredFromHowTheParameterIsUsed(string $body, string $signature, array $expected): void
+    {
+        $this->assertSame($expected, self::values($this->domainOf($body, $signature)));
+    }
+
+    public function testPropertyUsageGivesTheDomainOfConstructorAndFactoryParameters(): void
+    {
+        $methods = $this->analyse(['Email.php' => <<<'PHP'
+            namespace App;
+            final class Email
+            {
+                private function __construct(private string $value) {}
+                public static function from(string $value): self { return new self(strtolower($value)); }
+                public function isValid(): bool { return filter_var($this->value, FILTER_VALIDATE_EMAIL) !== false; }
+            }
+            PHP])['App\Email']['methods'];
+
+        $this->assertSame(["'user@example.com'"], self::values($methods['__construct']['domains']['value']));
+        $this->assertSame(["'user@example.com'"], self::values($methods['from']['domains']['value']));
+    }
+
+    public function testCaughtExceptionsAreCollectedAndFollowed(): void
+    {
+        $methods = $this->analyse(['Svc.php' => <<<'PHP'
+            namespace App;
+            use App\Errors\GatewayError;
+            final class Svc
+            {
+                public function run(): int { return $this->safe(); }
+                private function safe(): int
+                {
+                    try { return 1; } catch (GatewayError | \InvalidArgumentException) { return 0; }
+                }
+            }
+            PHP])['App\Svc']['methods'];
+
+        $this->assertSame(['App\Errors\GatewayError', 'InvalidArgumentException'], $methods['run']['catches']);
+    }
+
     // ---- Domains from PHPDoc ----------------------------------------------------------
 
     public function testPhpDocLiteralUnionIsExhaustive(): void
