@@ -16,6 +16,7 @@ final class Cli
           --out=DIR              output directory (default: <project>/tests/Testor)
           --max-cases=N          input combinations explored per method and per round (default: 20)
           --search-rounds=N      coverage-guided search rounds around the best cases (default: 3, 0 = off)
+          --case-timeout=SECONDS a recorded case running longer is dropped (infinite loops; default: 5)
           --select=STRATEGY      both: keep a case if it has a new outcome or covers new lines (default)
                                  outcome: one test per distinct outcome
                                  coverage: smallest set of tests covering the same lines
@@ -29,7 +30,7 @@ final class Cli
     /** @param list<string> $argv */
     public function run(array $argv): int
     {
-        $options = ['project' => getcwd(), 'out' => null, 'max-cases' => '20', 'select' => 'both', 'search-rounds' => '3'];
+        $options = ['project' => getcwd(), 'out' => null, 'max-cases' => '20', 'select' => 'both', 'search-rounds' => '3', 'case-timeout' => '5'];
         $flags = ['allow-side-effects' => false, 'verbose' => false];
         $paths = [];
 
@@ -42,7 +43,7 @@ final class Cli
                 $flags['verbose'] = true;
             } elseif ($arg === '--allow-side-effects') {
                 $flags['allow-side-effects'] = true;
-            } elseif (preg_match('/^--(project|out|max-cases|select|search-rounds)=(.+)$/', $arg, $m)) {
+            } elseif (preg_match('/^--(project|out|max-cases|select|search-rounds|case-timeout)=(.+)$/', $arg, $m)) {
                 $options[$m[1]] = $m[2];
             } elseif (str_starts_with($arg, '-')) {
                 fwrite(STDERR, "Unknown option: $arg\n\n" . self::USAGE);
@@ -77,7 +78,7 @@ final class Cli
 
         try {
             $generator = new Generator($project, (string) realpath($out), (int) $options['max-cases'],
-                $flags['allow-side-effects'], $flags['verbose'], $options['select'], (int) $options['search-rounds']);
+                $flags['allow-side-effects'], $flags['verbose'], $options['select'], (int) $options['search-rounds'], (float) $options['case-timeout']);
             $reports = $generator->generate($resolved);
         } catch (\RuntimeException|\InvalidArgumentException $e) {
             fwrite(STDERR, "error: {$e->getMessage()}\n");

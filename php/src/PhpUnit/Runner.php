@@ -10,7 +10,8 @@ use Testor\Process;
 final class Runner
 {
     // e.g. "Test Triggered PHP Warning (Tests\FooTest::testBar) in /src/Foo.php:12"
-    private const EVENT_NOTICE = '/^Test Triggered (?:PHP )?(?:Warning|Notice|Deprecation) \((?<test>[^,)]+)(?<extra>[^)]*)\)/m';
+    // and "Test Considered Risky (Tests\FooTest::testBar)" (fails projects configured with failOnRisky).
+    private const EVENT_NOTICE = '/^Test (?:Triggered (?:PHP )?(?:Warning|Notice|Deprecation)|Considered Risky) \((?<test>[^,)]+)(?<extra>[^)]*)\)/m';
     private const CONFIG_FILES = ['phpunit.xml', 'phpunit.xml.dist', 'phpunit.dist.xml'];
 
     public function __construct(private readonly string $project)
@@ -28,8 +29,13 @@ final class Runner
         return null;
     }
 
-    /** @param array<string, string> $env */
-    public function run(string $testFile, array $env = []): RunResult
+    /**
+     * @param array<string, string> $env
+     * @param list<string> $options extra PHPUnit options
+     * @param (callable(): bool)|null $watch kills the run when it returns true
+     */
+    public function run(string $testFile, array $env = [], array $options = [], ?callable $watch = null,
+                        float $timeout = 600): RunResult
     {
         $tmp = Process::tempDir();
         try {
@@ -47,11 +53,11 @@ final class Runner
             if (!$hasConfig) {
                 $cmd = [...$cmd, '--bootstrap', "$this->project/vendor/autoload.php"];
             }
-            $cmd[] = $testFile;
+            $cmd = [...$cmd, ...$options, $testFile];
 
-            [$code, $stdout, $stderr] = Process::run($cmd, $this->project, $env);
+            [$code, $stdout, $stderr, $killed] = Process::run($cmd, $this->project, $env, watch: $watch, timeout: $timeout);
             [$failed, $passed] = $this->parseJunit($junit);
-            return new RunResult($code, $stdout . $stderr, $failed, $passed, $this->parseEvents($events));
+            return new RunResult($code, $stdout . $stderr, $failed, $passed, $this->parseEvents($events), $killed);
         } finally {
             Process::removeDir($tmp);
         }
@@ -62,8 +68,8 @@ final class Runner
     {
         $failed = [];
         $passed = [];
-        if (!is_file($path)) {
-            return [$failed, $passed];
+        if (!is_file($path) || filesize($path) === 0) {
+            return [$failed, $passed]; // killed before PHPUnit wrote the log
         }
         $doc = new \DOMDocument();
         $doc->load($path);

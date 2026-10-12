@@ -112,7 +112,7 @@ final class CaseBuilder
             }
             $slot = $dim['target'] . ':' . $dim['name'];
             if ($dim['kind'] === 'value') {
-                $vals[$slot] = $option;
+                $vals[$slot] = ($dim['spied'] ?? []) === [] ? $option : $option->withSpied($dim['spied']);
             } else {
                 $vals[$slot] = $vals[$slot]->configured($dim['method'], $option['returns'], $option['throws']);
             }
@@ -193,6 +193,12 @@ final class CaseBuilder
         }
         $stubbed = $this->values->type($type['name']);
         $throwable = $this->throwable($method['catches'] ?? [], $imports);
+        // Called void methods are spied on too: their calls are the only trace of what they do.
+        $dims[0]['spied'] = array_values(array_filter(array_map(
+            fn (string $lower) => in_array($stubbed['methods'][$lower]['returnType']['name'] ?? null, ['void'], true)
+                ? $stubbed['methods'][$lower]['name'] : null,
+            $called,
+        )));
         foreach ($called as $lower) {
             $m = $stubbed['methods'][$lower] ?? null;
             if ($m === null) {

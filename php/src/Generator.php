@@ -35,6 +35,7 @@ final class Generator
         private readonly bool $verbose = false,
         private readonly string $select = 'both',
         private readonly int $searchRounds = 3,
+        private readonly float $caseTimeout = 5.0,
     ) {
         if (!in_array($select, ['outcome', 'coverage', 'both'], true)) {
             throw new \InvalidArgumentException("Unknown selection strategy: $select");
@@ -124,7 +125,13 @@ final class Generator
         for ($round = 0; $round < self::MAX_GATE_ROUNDS && $selected !== []; $round++) {
             [$source, $names] = $this->renderer->final($class, $selected, $imports, $namespace);
             file_put_contents($target, $source);
-            $result = $this->runner->run($target);
+            // Every test passed recording, so a hang here is unexpected: bounded anyway.
+            $result = $this->runner->run($target, timeout: max(60.0, count($selected) * $this->caseTimeout));
+            if ($result->killed) {
+                $report->error = 'the generated tests timed out';
+                $selected = [];
+                break;
+            }
             if ($this->verbose && $result->failed !== []) {
                 fwrite(STDERR, $result->output);
             }
@@ -162,24 +169,50 @@ final class Generator
 
     /**
      * Runs every scenario once and returns the records ({cases: id => outcome, executable: file => lines}),
-     * plus PHPUnit's output.
+     * plus PHPUnit's output. Cases run in a fixed order; a case still running after the case timeout
+     * (an infinite loop in the code under test) gets a "timeout" outcome and the run resumes after it.
      *
      * @param list<Scenario> $cases
      * @return array{array, string}
      */
     private function record(array $class, array $cases, Imports $imports): array
     {
-        $tmp = Process::tempDir();
-        try {
-            $testFile = "$tmp/" . Imports::short($class['name']) . 'Test.php';
-            $recordFile = "$tmp/records.json";
-            file_put_contents($testFile, $this->renderer->recording($class, $cases, $imports, __DIR__ . '/Runtime/Recorder.php'));
-            $result = $this->runner->run($testFile, ['TESTOR_RECORD_FILE' => $recordFile]);
-            $records = is_file($recordFile) ? json_decode((string) file_get_contents($recordFile), true) : [];
-            return [$records ?: [], $result->output];
-        } finally {
-            Process::removeDir($tmp);
+        $records = ['cases' => []];
+        $output = '';
+        $pending = $cases;
+        while ($pending !== []) {
+            $tmp = Process::tempDir();
+            try {
+                $testFile = "$tmp/" . Imports::short($class['name']) . 'Test.php';
+                $recordFile = "$tmp/records.json";
+                file_put_contents($testFile, $this->renderer->recording($class, $pending, $imports, __DIR__ . '/Runtime/Recorder.php'));
+                $running = "$recordFile.running";
+                $watch = function () use ($running): bool {
+                    clearstatcache(true, $running);
+                    return is_file($running) && microtime(true) - (float) @filemtime($running) > $this->caseTimeout;
+                };
+                $result = $this->runner->run($testFile, ['TESTOR_RECORD_FILE' => $recordFile], ['--order-by=default'], $watch);
+                $output .= $result->output;
+
+                $run = is_file($recordFile) ? json_decode((string) file_get_contents($recordFile), true) : [];
+                $records['cases'] = [...$records['cases'], ...$run['cases'] ?? []];
+                if (isset($run['executable'])) {
+                    $records['executable'] = array_replace($records['executable'] ?? [], $run['executable']);
+                }
+                if (!$result->killed) {
+                    break; // cases without a record failed before recording (e.g. while building the object)
+                }
+                $stuck = is_file($running) ? trim((string) file_get_contents($running)) : null;
+                if ($stuck === null || $stuck === '') {
+                    break;
+                }
+                $records['cases'][$stuck] = ['kind' => 'timeout'];
+                $pending = array_values(array_filter($pending, fn (Scenario $c) => !isset($records['cases'][$c->id])));
+            } finally {
+                Process::removeDir($tmp);
+            }
         }
+        return [$records, $output];
     }
 
     /**
@@ -266,7 +299,10 @@ final class Generator
         $selected = [];
         foreach ($candidates as $candidate) {
             [$case, $outcome] = $candidate;
-            $signature = $case->method['name'] . json_encode(self::sortKeys($outcome));
+            // Interactions count by shape (which methods, how many calls), not by arguments: otherwise
+            // every input passed on to a dependency would look like a new behaviour.
+            $shape = array_map(fn (array $call) => [$call[0], $call[1]], $outcome['calls'] ?? []);
+            $signature = $case->method['name'] . json_encode(self::sortKeys(['calls' => $shape] + $outcome));
             if (!isset($seen[$signature])) {
                 $seen[$signature] = true;
                 $selected[] = $candidate;
@@ -339,7 +375,7 @@ final class Generator
     private function isNoise(array $outcome): bool
     {
         return match ($outcome['kind']) {
-            'other', 'notice' => true,
+            'other', 'notice', 'timeout' => true,
             'throws' => in_array($outcome['class'], self::NOISE_EXCEPTIONS, true) || str_starts_with($outcome['class'], 'PHPUnit\\'),
             default => false,
         };

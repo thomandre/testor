@@ -34,10 +34,14 @@ final class RecorderTest extends TestCase
         @unlink($this->file);
     }
 
+    /** The outcome recorded for $call, without the (empty) list of spied calls. */
     private function record(callable $call): array
     {
         Recorder::record('id', $call);
-        return json_decode((string) file_get_contents($this->file), true)['cases']['id'];
+        $outcome = json_decode((string) file_get_contents($this->file), true)['cases']['id'];
+        $this->assertSame([], $outcome['calls']);
+        unset($outcome['calls']);
+        return $outcome;
     }
 
     public function testScalarsAndArraysAreExportedAsPhpCode(): void
@@ -102,6 +106,36 @@ final class RecorderTest extends TestCase
         $this->assertSame(['a', 'b'], array_keys(json_decode((string) file_get_contents($this->file), true)['cases']));
     }
 
+    public function testSpiesRecordCallsAndReturnTheConfiguredValue(): void
+    {
+        Recorder::start('id', []);
+        $spy = Recorder::spy('ctor:repo', 'find', fn () => 'found');
+        $double = $this->createStub(\Countable::class);
+
+        Recorder::record('id', fn () => [$spy(1, 'two', new \ArrayObject(), $double), $spy()]);
+        $outcome = json_decode((string) file_get_contents($this->file), true)['cases']['id'];
+
+        $this->assertSame("['found', 'found']", $outcome['export']);
+        $this->assertSame([
+            ['ctor:repo', 'find', [
+                ['kind' => 'value', 'export' => '1'],
+                ['kind' => 'value', 'export' => "'two'"],
+                ['kind' => 'object', 'class' => \ArrayObject::class],
+                ['kind' => 'object', 'class' => \Countable::class], // the doubled type, not MockObject_…
+            ]],
+            ['ctor:repo', 'find', []],
+        ], $outcome['calls']);
+        $this->assertFileDoesNotExist($this->file . '.running', 'the case is no longer running');
+    }
+
+    public function testStartMarksTheRunningCase(): void
+    {
+        Recorder::start('c42', []);
+
+        $this->assertSame('c42', file_get_contents($this->file . '.running'));
+        Recorder::record('c42', fn () => 1);
+    }
+
     public function testNoCoverageUnlessStarted(): void
     {
         $this->assertArrayNotHasKey('covered', $this->record(fn () => 1));
@@ -119,7 +153,7 @@ final class RecorderTest extends TestCase
             $this->markTestSkipped('PCOV does not instrument tests/: run `composer test` (sets pcov.directory)');
         }
 
-        Recorder::start([$file]);
+        Recorder::start('id', [$file]);
         $sut = new Branchy();
         Recorder::record('id', fn () => $sut->answer(true));
 

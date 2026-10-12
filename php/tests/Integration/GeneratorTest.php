@@ -86,11 +86,11 @@ final class GeneratorTest extends DemoProjectTestCase
     {
         $source = $this->generated('App\Orders\OrderService');
 
-        $this->assertStringContainsString("\$orders->method('find')->willReturn(null);", $source);
+        $this->assertStringContainsString("\$orders->expects(\$this->once())->method('find')->with(1)->willReturn(null);", $source);
         $this->assertStringContainsString("\$this->expectExceptionMessage('Order 1 not found');", $source);
-        $this->assertStringContainsString("\$payments->method('charge')->willReturn(false);", $source);
+        $this->assertStringContainsString("\$payments->expects(\$this->once())->method('charge')->with(3.0)->willReturn(false);", $source);
         $this->assertStringContainsString("\$this->assertSame('declined', \$sut->pay(1));", $source);
-        $this->assertStringContainsString("\$orders->method('find')->willReturn(new Order(1, 1.5));", $source);
+        $this->assertStringContainsString("\$orders->expects(\$this->once())->method('find')->with(1)->willReturn(new Order(1, 1.5));", $source);
         if (\Testor\Runtime\Recorder::driver() !== null) {
             $this->assertGreaterThanOrEqual(90.0, self::$reports['App\Orders\OrderService']->coverage());
         }
@@ -99,12 +99,12 @@ final class GeneratorTest extends DemoProjectTestCase
     public function testOptionalArgumentsAndCrossClassThresholds(): void
     {
         $this->assertStringContainsString(
-            "\$orders->method('find')->willReturn(new Order(1, 1.5, status: OrderStatus::Paid));",
+            "\$orders->expects(\$this->once())->method('find')->with(1)->willReturn(new Order(1, 1.5, status: OrderStatus::Paid));",
             $this->generated('App\Orders\OrderService'),
         );
         $this->assertStringContainsString("\$this->assertSame('already processed', \$sut->pay(1));", $this->generated('App\Orders\OrderService'));
         $this->assertStringContainsString(
-            "\$basket->method('itemCount')->willReturn(3);",
+            "\$basket->expects(\$this->once())->method('itemCount')->willReturn(3);",
             $this->generated('App\Orders\CheckoutService'),
             'threshold of ShippingPolicy::isFree()',
         );
@@ -129,7 +129,7 @@ final class GeneratorTest extends DemoProjectTestCase
     public function testDependencyExceptionsCoverCatchBlocks(): void
     {
         $this->assertStringContainsString(
-            "\$basket->method('itemCount')->willThrowException(new RuntimeException('testor'));",
+            "\$basket->expects(\$this->once())->method('itemCount')->willThrowException(new RuntimeException('testor'));",
             $this->generated('App\Orders\CheckoutService'),
         );
         $this->assertStringContainsString('public function testItemsOrZeroReturns0WhenItemCountThrows(): void', $this->generated('App\Orders\CheckoutService'));
@@ -150,6 +150,19 @@ final class GeneratorTest extends DemoProjectTestCase
         } finally {
             Process::removeDir($out);
         }
+    }
+
+    public function testInteractionsWithDependenciesAreAsserted(): void
+    {
+        $source = $this->generated('App\Orders\OrderService');
+
+        // When the order is missing, nothing is charged.
+        $this->assertMatchesRegularExpression(
+            "/function testPayThrowsDomainExceptionWhenFindReturnsNull\\(\\): void\\n    \\{\\n(.*\\n)*?.*->expects\\(\\\$this->never\\(\\)\\)->method\\('charge'\\);/",
+            $source,
+        );
+        // The charged amount includes the fee: amount + fee mutated to amount - fee would fail.
+        $this->assertStringContainsString("->method('charge')->with(3.0)", $source);
     }
 
     public function testMethodsWithSideEffectsAreSkipped(): void

@@ -72,10 +72,14 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
    needs `isMariaDB()` → `false` *and* `getVersion()` → `50706`, which no single variation reaches
    (89 % → 100 %). On phpMyAdmin (16 classes), line coverage goes from 61.3 % to 64.0 % with the inferred
    values, then to 66.1 % with the search, for about 1.5 s more.
-5. **Recording:** a temporary test file runs every case, and `Runtime/Recorder.php` captures the outcome
-   (value, exception, object…, or PHP warnings).
-6. **Selection:** discarded cases are the `TypeError` results caused by testor's own inputs and the cases
-   that raise warnings, notices or deprecations. Among the remaining cases, a case is kept if:
+5. **Recording:** a temporary test file runs every case in a fixed order, and `Runtime/Recorder.php`
+   captures the outcome (value, exception, object…, or PHP warnings) and, through spies on the stubs, every
+   call made to dependencies with its arguments. A case still running after `--case-timeout` seconds
+   (default 5: an infinite loop in the code under test, e.g. a negative step) is dropped and the run
+   resumes with the next case.
+6. **Selection:** discarded cases are the `TypeError` results caused by testor's own inputs, the cases
+   that raise warnings, notices or deprecations, and those that time out. Among the remaining cases, a case
+   is kept if (the outcome includes which dependency methods were called, not their arguments):
    - `both` (default): it produces a new outcome for its method **or** it covers new lines;
    - `outcome`: it produces a new (method, outcome) pair;
    - `coverage`: it belongs to the smallest set covering the same lines (greedy set cover).
@@ -84,7 +88,11 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
    (60.6 %) and `both` keeps 232 tests (60.9 %). Different inputs can return the same value through different
    branches, and different values can come from a single line (`return $a ? 'x' : 'y';`): each strategy
    misses what the other one catches.
-7. **Gate:** tests that fail or raise warnings (read from PHPUnit's event log) are removed.
+7. **Interaction assertions:** stubs whose calls were recorded become mocks expecting them:
+   `->expects($this->once())->method('charge')->with(3.0)`, `exactly(n)`, or `never()` when the method
+   was not called (when `find()` returns `null`, nothing is charged). Arguments that are test doubles are
+   asserted by type (`$this->isInstanceOf(ResultInterface::class)`).
+8. **Gate:** tests that fail, raise warnings or are risky (read from PHPUnit's event log) are removed.
    PHPUnit always runs with `--no-coverage --no-logging`, so the project's own coverage reports and logs
    are never produced (they are slow, and they would write into the project).
    Two consecutive clean runs are required. Generated classes use `#[BackupGlobals]` and
@@ -93,6 +101,14 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
 Test names say what the test checks and which input differs from the baseline call:
 `testPayThrowsDomainExceptionWhenFindReturnsNull`, `testGradeReturnsAWithScore90`,
 `testItemsOrZeroReturns0WhenItemCountThrows`.
+
+### Measuring test strength
+
+Line coverage says what the tests run, not what they check. Mutation testing does: [Infection](https://infection.github.io)
+changes the code (`+` into `-`, `>=` into `>`…) and counts the changes the tests detect (MSI). With
+`.tools/infection.phar`, a phpunit.xml whose test suite is the generated directory, and an infection.json5
+pointing at it (keep both outside the project). Covered code MSI with interaction assertions: 7 phpMyAdmin
+classes with injected dependencies 63 % → 73 %, demo 82 % → 83 %.
 
 These are **characterization tests**: they protect against regressions, but they cannot tell
 whether the current behaviour is correct.

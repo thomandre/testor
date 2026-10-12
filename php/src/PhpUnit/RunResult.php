@@ -17,6 +17,7 @@ final readonly class RunResult
         public array $failed,
         public array $passed,
         public array $noisy,
+        public bool $killed = false,
     ) {
     }
 }

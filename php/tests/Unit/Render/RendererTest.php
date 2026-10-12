@@ -93,6 +93,60 @@ final class RendererTest extends TestCase
         ], $names, 'at most two variations');
     }
 
+    public function testRecordingSpiesOnConfiguredAndVoidMethods(): void
+    {
+        $stub = new Val('$this->createStub(Gateway::class)', hoist: true, returns: ['charge' => 'true'],
+            throws: ['fee' => "new RuntimeException('testor')"], spied: ['log']);
+        $case = self::scenario('pay', [], new Construction(null, [new Arg('gateway', $stub)]));
+
+        [$lines] = $this->renderer->arrange($case, 'Svc', recording: true);
+
+        $this->assertSame([
+            '$gateway = $this->createStub(Gateway::class);',
+            "\$gateway->method('charge')->willReturnCallback(\\Testor\\Runtime\\Recorder::spy('ctor:gateway', 'charge', fn () => true));",
+            "\$gateway->method('fee')->willReturnCallback(\\Testor\\Runtime\\Recorder::spy('ctor:gateway', 'fee', fn () => throw new RuntimeException('testor')));",
+            "\$gateway->method('log')->willReturnCallback(\\Testor\\Runtime\\Recorder::spy('ctor:gateway', 'log', fn () => null));",
+            '$sut = new Svc($gateway);',
+        ], $lines);
+    }
+
+    public function testFinalTestsExpectTheRecordedCalls(): void
+    {
+        $stub = new Val('$this->createStub(Gateway::class)', hoist: true, returns: ['charge' => 'true', 'fee' => '1.5'], spied: ['log']);
+        $case = self::scenario('pay', [], new Construction(null, [new Arg('gateway', $stub)]));
+        $calls = [
+            ['ctor:gateway', 'charge', [['kind' => 'value', 'export' => '3.0'], ['kind' => 'object', 'class' => 'App\Card']]],
+            ['ctor:gateway', 'log', [['kind' => 'any']]],
+            ['ctor:gateway', 'log', [['kind' => 'any']]],
+        ];
+        $imports = new Imports();
+
+        [$lines] = $this->renderer->arrange($case, 'Svc', $calls, imports: $imports);
+
+        $this->assertSame([
+            '$gateway = $this->createMock(Gateway::class);',
+            "\$gateway->expects(\$this->once())->method('charge')->with(3.0, \$this->isInstanceOf(Card::class))->willReturn(true);",
+            "\$gateway->expects(\$this->never())->method('fee');",
+            "\$gateway->expects(\$this->exactly(2))->method('log');",
+            '$sut = new Svc($gateway);',
+        ], $lines);
+        $this->assertSame(['use App\Card;'], $imports->lines());
+    }
+
+    public function testVoidMethodTestsRelyOnMockExpectations(): void
+    {
+        $stub = new Val('$this->createStub(Mailer::class)', hoist: true, spied: ['send']);
+        $case = new Scenario('c0', self::method('notify', [], ['returnType' => self::builtin('void')]),
+            new Construction(null, [new Arg('mailer', $stub)]), []);
+
+        [$source] = $this->renderer->final(self::classDescriptor('App\Svc', []), [[$case, [
+            'kind' => 'value', 'export' => 'null', 'type' => 'null', 'calls' => [['ctor:mailer', 'send', []]],
+        ]]], new Imports(), 'Tests');
+
+        $this->assertStringContainsString("\$mailer->expects(\$this->once())->method('send');", $source);
+        $this->assertStringNotContainsString('expectNotToPerformAssertions', $source);
+    }
+
     public function testArrangeWithFactoryAndStaticCall(): void
     {
         $this->assertSame(

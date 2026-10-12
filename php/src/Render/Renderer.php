@@ -8,6 +8,7 @@ use Testor\Cases\Arg;
 use Testor\Cases\Imports;
 use Testor\Cases\Labels;
 use Testor\Cases\Scenario;
+use Testor\Cases\Val;
 
 /** Renders PHPUnit test files: a throwaway recording file and the final test file. */
 final class Renderer
@@ -20,12 +21,21 @@ final class Renderer
         return "'" . str_replace(['\\', "'"], ['\\\\', "\\'"], $s) . "'";
     }
 
-    /** @return array{list<string>, string} setup lines and the call expression */
-    public function arrange(Scenario $case, string $sut): array
+    /**
+     * Setup lines and the call expression of a scenario. Stubs are configured three ways:
+     *  - recording: spied methods go through Recorder::spy() to record their calls;
+     *  - final, with the recorded $calls: stubs with spied methods become mocks expecting those calls;
+     *  - otherwise: plain willReturn()/willThrowException().
+     *
+     * @param list<array{string, string, list<array>}>|null $calls recorded [stub key, method, arguments]
+     * @return array{list<string>, string}
+     */
+    public function arrange(Scenario $case, string $sut, ?array $calls = null, bool $recording = false,
+                            ?Imports $imports = null): array
     {
         $lines = [];
         $used = ['sut' => true, 'this' => true];
-        $use = function (Arg $arg) use (&$lines, &$used): string {
+        $use = function (Arg $arg, string $key) use (&$lines, &$used, $calls, $recording, $imports): string {
             if (!$arg->val->hoist) {
                 return $arg->val->expr;
             }
@@ -34,29 +44,101 @@ final class Renderer
                 $var = $arg->name . $n;
             }
             $used[$var] = true;
-            $lines[] = "\$$var = {$arg->val->expr};";
-            foreach ($arg->val->returns as $method => $value) {
-                $lines[] = '$' . $var . "->method('$method')->willReturn($value);";
-            }
-            foreach ($arg->val->throws as $method => $exception) {
-                $lines[] = '$' . $var . "->method('$method')->willThrowException($exception);";
+            $val = $arg->val;
+            $spied = $val->spiedMethods();
+            $mock = !$recording && $calls !== null && $spied !== [];
+            $expr = $mock ? str_replace('$this->createStub(', '$this->createMock(', $val->expr) : $val->expr;
+            $lines[] = "\$$var = $expr;";
+            foreach ($spied as $method) {
+                $outcome = isset($val->throws[$method]) ? "throw {$val->throws[$method]}" : ($val->returns[$method] ?? 'null');
+                if ($recording) {
+                    $lines[] = '$' . $var . "->method('$method')->willReturnCallback(\\" . self::RECORDER
+                        . "::spy('$key', '$method', fn () => $outcome));";
+                } elseif ($mock) {
+                    $lines[] = '$' . $var . $this->expectation($method, $val, self::callsTo($calls, $key, $method), $imports);
+                } elseif (isset($val->throws[$method])) {
+                    $lines[] = '$' . $var . "->method('$method')->willThrowException({$val->throws[$method]});";
+                } elseif (isset($val->returns[$method])) {
+                    $lines[] = '$' . $var . "->method('$method')->willReturn({$val->returns[$method]});";
+                }
             }
             return "\$$var";
         };
 
         $name = $case->method['name'];
         if ($case->construction === null) {
-            $args = implode(', ', array_map($use, $case->args));
+            $args = implode(', ', array_map(fn (Arg $a) => $use($a, "arg:{$a->name}"), $case->args));
             return [$lines, "$sut::$name($args)"];
         }
 
         $build = $case->construction;
-        $ctorArgs = implode(', ', array_map($use, $build->args));
+        $ctorArgs = implode(', ', array_map(fn (Arg $a) => $use($a, "ctor:{$a->name}"), $build->args));
         $lines[] = $build->factory !== null
             ? "\$sut = $sut::{$build->factory}($ctorArgs);"
             : "\$sut = new $sut($ctorArgs);";
-        $args = implode(', ', array_map($use, $case->args));
+        $args = implode(', ', array_map(fn (Arg $a) => $use($a, "arg:{$a->name}"), $case->args));
         return [$lines, "\$sut->$name($args)"];
+    }
+
+    /** @param list<string> $setup */
+    private static function expectsCalls(array $setup): bool
+    {
+        foreach ($setup as $line) {
+            if (str_contains($line, '->expects(')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** @return list<list<array>> arguments of each recorded call of $method on the stub $key */
+    private static function callsTo(array $calls, string $key, string $method): array
+    {
+        $args = [];
+        foreach ($calls as [$stub, $called, $arguments]) {
+            if ($stub === $key && $called === $method) {
+                $args[] = $arguments;
+            }
+        }
+        return $args;
+    }
+
+    /**
+     * `->expects(...)->method(...)->with(...)->willReturn(...)` for a mocked method: never() when it was
+     * not called, once() with its arguments, or exactly(n).
+     *
+     * @param list<list<array>> $calls
+     */
+    private function expectation(string $method, Val $val, array $calls, ?Imports $imports): string
+    {
+        $count = count($calls);
+        $times = match ($count) {
+            0 => '$this->never()',
+            1 => '$this->once()',
+            default => "\$this->exactly($count)",
+        };
+        $line = "->expects($times)->method('$method')";
+        if ($count === 0) {
+            return "$line;";
+        }
+        if ($count === 1 && $calls[0] !== []) {
+            $line .= '->with(' . implode(', ', array_map(fn (array $a) => $this->argument($a, $imports), $calls[0])) . ')';
+        }
+        if (isset($val->throws[$method])) {
+            $line .= "->willThrowException({$val->throws[$method]})";
+        } elseif (isset($val->returns[$method])) {
+            $line .= "->willReturn({$val->returns[$method]})";
+        }
+        return "$line;";
+    }
+
+    private function argument(array $arg, ?Imports $imports): string
+    {
+        return match ($arg['kind']) {
+            'value' => $arg['export'],
+            'object' => '$this->isInstanceOf(' . ($imports?->ref($arg['class']) ?? '\\' . $arg['class']) . '::class)',
+            default => '$this->anything()',
+        };
     }
 
     /** @param list<Scenario> $cases */
@@ -69,10 +151,10 @@ final class Renderer
         $cover = array_map(self::phpString(...), [$class['file'], ...$class['ancestorFiles'] ?? []]);
         $body = ['    private const COVER = [' . implode(', ', $cover) . '];', ''];
         foreach ($cases as $case) {
-            [$setup, $call] = $this->arrange($case, $sut);
+            [$setup, $call] = $this->arrange($case, $sut, recording: true);
             $body = [...$body, ...$this->method("test_{$case->id}", [
                 // Measure from construction on, so constructor lines count as covered.
-                '\\' . self::RECORDER . '::start(self::COVER);',
+                '\\' . self::RECORDER . "::start('{$case->id}', self::COVER);",
                 ...$setup,
                 '\\' . self::RECORDER . "::record('{$case->id}', fn () => $call);",
                 '$this->addToAssertionCount(1);',
@@ -104,9 +186,14 @@ final class Renderer
         $names = [];
 
         foreach ($cases as [$case, $outcome]) {
-            [$setup, $call] = $this->arrange($case, $sut);
+            [$setup, $call] = $this->arrange($case, $sut, $outcome['calls'] ?? null, imports: $imports);
             $returnsVoid = ($case->method['returnType']['name'] ?? null) === 'void';
             [$suffix, $act] = $this->assertion($outcome, $call, $returnsVoid, $imports);
+            if (self::expectsCalls($setup)) {
+                // Mock expectations are the assertions of a void method's test.
+                $act = array_values(array_filter($act, fn (string $l) => $l !== '$this->expectNotToPerformAssertions();' && $l !== ''))
+                    ?: $act;
+            }
             // What differs from the baseline call, e.g. "WhenFindReturnsNull" (at most two parts).
             $base = 'test' . ucfirst($case->method['name']) . $suffix . implode('And', array_slice($case->variations, 0, 2));
             $name = $base;
