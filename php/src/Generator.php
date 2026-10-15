@@ -9,6 +9,7 @@ use Testor\Cases\Imports;
 use Testor\Cases\Scenario;
 use Testor\Cases\Values;
 use Testor\PhpUnit\Runner;
+use Testor\Runtime\Recorder;
 use Testor\Render\Renderer;
 
 /**
@@ -35,7 +36,8 @@ final class Generator
         private readonly bool $verbose = false,
         private readonly string $select = 'both',
         private readonly int $searchRounds = 3,
-        private readonly float $caseTimeout = 5.0,
+        private readonly float $caseTimeout = 2.0,
+        private readonly int $jobs = 1,
     ) {
         if (!in_array($select, ['outcome', 'coverage', 'both'], true)) {
             throw new \InvalidArgumentException("Unknown selection strategy: $select");
@@ -58,10 +60,70 @@ final class Generator
         $data = (new Introspector())->describe($this->project, $this->phpFiles($paths));
         $this->values = new Values($data['types']);
         $reports = array_map(fn (array $e) => new ClassReport($e['class'], error: $e['error']), $data['errors']);
-        foreach ($data['classes'] as $class) {
+        $classes = $data['classes'];
+        if ($this->jobs > 1 && count($classes) > 1 && function_exists('pcntl_fork')) {
+            return [...$reports, ...$this->generateInParallel($classes)];
+        }
+        foreach ($classes as $class) {
             $reports[] = $this->generateClass($class);
         }
         return $reports;
+    }
+
+    /**
+     * Classes are independent: each one is generated in a forked child process, at most $jobs at a
+     * time, the most expensive first (so a big class does not end up running alone at the end).
+     * Reports come back in the classes' order, so the result is the same as a sequential run.
+     *
+     * @param list<array> $classes
+     * @return list<ClassReport>
+     */
+    private function generateInParallel(array $classes): array
+    {
+        $cost = fn (array $class) => array_sum(array_map(fn (array $m) => 1 + count($m['params']), $class['methods']));
+        $queue = array_keys($classes);
+        usort($queue, fn (int $a, int $b) => $cost($classes[$b]) <=> $cost($classes[$a]));
+
+        $tmp = Process::tempDir();
+        $running = [];
+        $reports = [];
+        try {
+            while ($queue !== [] || $running !== []) {
+                while ($queue !== [] && count($running) < $this->jobs) {
+                    $i = array_shift($queue);
+                    $pid = pcntl_fork();
+                    if ($pid === -1) {
+                        $reports[$i] = $this->generateClass($classes[$i]); // cannot fork: do it here
+                    } elseif ($pid === 0) {
+                        try {
+                            $report = $this->generateClass($classes[$i]);
+                        } catch (\Throwable $e) {
+                            $report = new ClassReport($classes[$i]['name'], error: $e->getMessage());
+                        }
+                        file_put_contents("$tmp/$i", serialize($report));
+                        exit(0);
+                    } else {
+                        $running[$pid] = $i;
+                    }
+                }
+                if ($running === []) {
+                    continue;
+                }
+                $pid = pcntl_wait($status);
+                if (isset($running[$pid])) {
+                    $i = $running[$pid];
+                    unset($running[$pid]);
+                    $report = is_file("$tmp/$i") ? unserialize((string) file_get_contents("$tmp/$i")) : false;
+                    $reports[$i] = $report instanceof ClassReport
+                        ? $report
+                        : new ClassReport($classes[$i]['name'], error: 'the generation process for this class crashed');
+                }
+            }
+        } finally {
+            Process::removeDir($tmp);
+        }
+        ksort($reports);
+        return array_values($reports);
     }
 
     private function generateClass(array $class): ClassReport
@@ -194,7 +256,7 @@ final class Generator
                 $result = $this->runner->run($testFile, ['TESTOR_RECORD_FILE' => $recordFile], ['--order-by=default'], $watch);
                 $output .= $result->output;
 
-                $run = is_file($recordFile) ? json_decode((string) file_get_contents($recordFile), true) : [];
+                $run = Recorder::read($recordFile);
                 $records['cases'] = [...$records['cases'], ...$run['cases'] ?? []];
                 if (isset($run['executable'])) {
                     $records['executable'] = array_replace($records['executable'] ?? [], $run['executable']);

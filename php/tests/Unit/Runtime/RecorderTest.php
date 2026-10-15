@@ -38,7 +38,7 @@ final class RecorderTest extends TestCase
     private function record(callable $call): array
     {
         Recorder::record('id', $call);
-        $outcome = json_decode((string) file_get_contents($this->file), true)['cases']['id'];
+        $outcome = Recorder::read($this->file)['cases']['id'];
         $this->assertSame([], $outcome['calls']);
         unset($outcome['calls']);
         return $outcome;
@@ -92,10 +92,49 @@ final class RecorderTest extends TestCase
     public function testNonExportableValues(): void
     {
         $this->assertSame(['kind' => 'nan'], $this->record(fn () => NAN));
-        $this->assertSame(['kind' => 'object', 'class' => \ArrayObject::class], $this->record(fn () => new \ArrayObject()));
-        $this->assertSame(['kind' => 'object', 'class' => null], $this->record(fn () => new class {}));
         $this->assertSame(['kind' => 'array', 'count' => 1], $this->record(fn () => [new \stdClass()]));
-        $this->assertSame(['kind' => 'array', 'count' => 500], $this->record(fn () => range(1, 500)), 'too long to inline');
+        $this->assertSame(['kind' => 'array', 'count' => 5000], $this->record(fn () => range(1, 5000)), 'too large to assert');
+    }
+
+    public function testLargeArraysArePrettyPrintedOneItemPerLine(): void
+    {
+        $value = ['name' => str_repeat('x', 60), 'tags' => range(1, 30), 'empty' => []];
+        $export = $this->record(fn () => $value)['export'];
+
+        $this->assertStringStartsWith("[\n    'name' => 'xxx", $export);
+        $this->assertStringContainsString("\n    'tags' => [\n        1,\n        2,", $export, 'nested arrays are indented');
+        $this->assertStringContainsString("\n    'empty' => [],\n]", $export);
+        $this->assertSame($value, eval("return $export;"));
+    }
+
+    public function testStringsWithControlCharactersStayOnOneLine(): void
+    {
+        $value = "line 1\nline 2\t\$var \"quoted\" \\ \x07";
+        $export = $this->record(fn () => $value)['export'];
+
+        $this->assertStringNotContainsString("\n", $export);
+        $this->assertSame($value, eval("return $export;"));
+    }
+
+    public function testObjectsAreDescribedByTheirPublicState(): void
+    {
+        $object = new class {
+            public int $id = 7;
+            public array $tags = ['a'];
+            public \stdClass $nested;
+            protected string $hidden = 'no';
+            public function __construct() { $this->nested = new \stdClass(); }
+        };
+        $this->assertSame(
+            ['kind' => 'object', 'class' => null, 'properties' => ['id' => '7', 'tags' => "['a']"], 'datetime' => null],
+            $this->record(fn () => $object),
+        );
+        $this->assertSame(
+            ['kind' => 'object', 'class' => \DateTimeImmutable::class, 'properties' => [], 'datetime' => '2024-01-15T10:30:00+00:00'],
+            $this->record(fn () => new \DateTimeImmutable('2024-01-15 10:30:00', new \DateTimeZone('UTC'))),
+        );
+        $double = $this->createStub(\Countable::class);
+        $this->assertSame(\Countable::class, $this->record(fn () => $double)['class'], 'doubled type, not TestStub_…');
     }
 
     public function testRecordsAccumulateInTheSameFile(): void
@@ -103,7 +142,7 @@ final class RecorderTest extends TestCase
         Recorder::record('a', fn () => 1);
         Recorder::record('b', fn () => 2);
 
-        $this->assertSame(['a', 'b'], array_keys(json_decode((string) file_get_contents($this->file), true)['cases']));
+        $this->assertSame(['a', 'b'], array_keys(Recorder::read($this->file)['cases']));
     }
 
     public function testSpiesRecordCallsAndReturnTheConfiguredValue(): void
@@ -113,7 +152,7 @@ final class RecorderTest extends TestCase
         $double = $this->createStub(\Countable::class);
 
         Recorder::record('id', fn () => [$spy(1, 'two', new \ArrayObject(), $double), $spy()]);
-        $outcome = json_decode((string) file_get_contents($this->file), true)['cases']['id'];
+        $outcome = Recorder::read($this->file)['cases']['id'];
 
         $this->assertSame("['found', 'found']", $outcome['export']);
         $this->assertSame([
@@ -139,7 +178,7 @@ final class RecorderTest extends TestCase
     public function testNoCoverageUnlessStarted(): void
     {
         $this->assertArrayNotHasKey('covered', $this->record(fn () => 1));
-        $this->assertArrayNotHasKey('executable', json_decode((string) file_get_contents($this->file), true));
+        $this->assertArrayNotHasKey('executable', Recorder::read($this->file));
     }
 
     public function testCoverageOfTheCallIsMeasured(): void
@@ -157,7 +196,7 @@ final class RecorderTest extends TestCase
         $sut = new Branchy();
         Recorder::record('id', fn () => $sut->answer(true));
 
-        $data = json_decode((string) file_get_contents($this->file), true);
+        $data = Recorder::read($this->file);
         $this->assertContains(12, $data['cases']['id']['covered'][$file]);
         $this->assertNotContains(14, $data['cases']['id']['covered'][$file]);
         $this->assertContains(14, $data['executable'][$file]);

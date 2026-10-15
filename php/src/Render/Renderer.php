@@ -65,9 +65,11 @@ final class Renderer
             return "\$$var";
         };
 
+        // Arguments are rendered before $lines is returned: rendering them declares their stubs.
+        $callArgs = fn (array $args) => implode(', ', array_map(fn (Arg $a) => $use($a, "arg:{$a->name}"), $args));
         $name = $case->method['name'];
         if ($case->construction === null) {
-            $args = implode(', ', array_map(fn (Arg $a) => $use($a, "arg:{$a->name}"), $case->args));
+            $args = $callArgs($case->args);
             return [$lines, "$sut::$name($args)"];
         }
 
@@ -76,7 +78,7 @@ final class Renderer
         $lines[] = $build->factory !== null
             ? "\$sut = $sut::{$build->factory}($ctorArgs);"
             : "\$sut = new $sut($ctorArgs);";
-        $args = implode(', ', array_map(fn (Arg $a) => $use($a, "arg:{$a->name}"), $case->args));
+        $args = $callArgs($case->args);
         return [$lines, "\$sut->$name($args)"];
     }
 
@@ -236,9 +238,9 @@ final class Renderer
                     return ['Returns' . ucfirst($export), ['$this->assert' . ucfirst($export) . "($call);"]];
                 }
                 // Short values name the test ("ReturnsDeclined"), others their type ("ReturnsArray").
-                $label = Labels::value(str_replace('\\', '', $export));
+                $label = str_contains($export, "\n") ? '' : Labels::value(str_replace('\\', '', $export));
                 $label = $label !== '' && !str_starts_with($label, 'Array') ? $label : ucfirst(Imports::short($outcome['type']));
-                return ['Returns' . $label, ["\$this->assertSame($export, $call);"]];
+                return ['Returns' . $label, self::assertSame($export, $call)];
             case 'nan':
                 return ['ReturnsNan', ["\$this->assertNan($call);"]];
             case 'array':
@@ -248,10 +250,34 @@ final class Renderer
             case 'object':
                 if ($outcome['class'] !== null) {
                     $cls = $imports->ref($outcome['class']);
-                    return ['Returns' . Imports::short($outcome['class']), ["\$this->assertInstanceOf($cls::class, $call);"]];
+                    $state = [];
+                    foreach ($outcome['properties'] ?? [] as $property => $export) {
+                        $state = [...$state, ...self::assertSame($export, "\$result->$property")];
+                    }
+                    if (($outcome['datetime'] ?? null) !== null) {
+                        $state[] = "\$this->assertSame('{$outcome['datetime']}', \$result->format(DATE_ATOM));";
+                    }
+                    $name = 'Returns' . Imports::short($outcome['class']);
+                    if ($state === []) {
+                        return [$name, ["\$this->assertInstanceOf($cls::class, $call);"]];
+                    }
+                    return [$name, ["\$result = $call;", '', "\$this->assertInstanceOf($cls::class, \$result);", ...$state]];
                 }
         }
         return ['ReturnsObject', ["\$this->assertIsObject($call);"]];
+    }
+
+    /**
+     * `$this->assertSame(<expected>, <actual>);` on as many lines as the (pretty-printed) expected value.
+     *
+     * @return list<string>
+     */
+    private static function assertSame(string $export, string $actual): array
+    {
+        $lines = explode("\n", $export);
+        $lines[0] = '$this->assertSame(' . $lines[0];
+        $lines[count($lines) - 1] .= ", $actual);";
+        return $lines;
     }
 
     /**

@@ -197,6 +197,25 @@ final class RendererTest extends TestCase
         $this->assertStringEndsWith("    }\n}\n", $source);
     }
 
+    public function testMultiLineValuesAndObjectState(): void
+    {
+        $class = self::classDescriptor('App\Calc', []);
+        [$source] = $this->renderer->final($class, [
+            [self::scenario('rows'), ['kind' => 'value', 'export' => "[\n    'a',\n    'b',\n]", 'type' => 'array']],
+            [self::scenario('order'), ['kind' => 'object', 'class' => 'App\Order', 'properties' => ['id' => '1', 'status' => '\\App\\Status::Paid'],
+                'datetime' => null]],
+            [self::scenario('when'), ['kind' => 'object', 'class' => 'DateTimeImmutable', 'properties' => [], 'datetime' => '2024-01-15T10:30:00+00:00']],
+        ], new Imports(), 'Tests');
+
+        $this->assertStringContainsString("        \$this->assertSame([\n            'a',\n            'b',\n        ], \$sut->rows());\n", $source);
+        $this->assertStringContainsString(
+            "        \$result = \$sut->order();\n\n        \$this->assertInstanceOf(Order::class, \$result);\n"
+            . "        \$this->assertSame(1, \$result->id);\n        \$this->assertSame(\\App\\Status::Paid, \$result->status);\n",
+            $source,
+        );
+        $this->assertStringContainsString("\$this->assertSame('2024-01-15T10:30:00+00:00', \$result->format(DATE_ATOM));", $source);
+    }
+
     public function testFinalFileIsValidPhp(): void
     {
         $class = self::classDescriptor('App\Calc', []);

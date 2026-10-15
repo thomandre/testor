@@ -19,7 +19,16 @@ vendor/bin/testor src/
 ```
 
 Options: `--project=DIR` (default: cwd), `--out=DIR` (default: `<project>/tests/Testor`),
-`--max-cases=N` (default 20), `--select=both|outcome|coverage`, `--allow-side-effects`, `-v`.
+`--max-cases=N` (default 20), `--select=both|outcome|coverage`, `--search-rounds=N` (default 3),
+`--case-timeout=SECONDS` (default 2), `--jobs=N` (default: CPU count, at most 8), `--allow-side-effects`, `-v`.
+
+**Speed:** about 95 % of the time is spent running PHPUnit (recording, search rounds, gate). Classes are
+independent, so they are generated in parallel (forked processes, biggest classes first; sequential
+without ext-pcntl), with exactly the same output as a sequential run. On 16 phpMyAdmin classes:
+14.8 s → 4.7 s for 279 tests (2,370 lines of test code).
+
+**Against a project's own tests:** on those 16 classes, phpMyAdmin's unit tests cover 74.9 % of the lines,
+testor's 67.1 %, and both together 88.8 %: testor covers 174 lines the project's tests do not.
 
 **Coverage:** with PCOV (recommended, `pecl install pcov`) or Xdebug in coverage mode, testor measures
 the lines each case executes and reports line coverage for every tested class. Without a coverage driver,
@@ -74,7 +83,9 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
    values, then to 66.1 % with the search, for about 1.5 s more.
 5. **Recording:** a temporary test file runs every case in a fixed order, and `Runtime/Recorder.php`
    captures the outcome (value, exception, object…, or PHP warnings) and, through spies on the stubs, every
-   call made to dependencies with its arguments. A case still running after `--case-timeout` seconds
+   call made to dependencies with its arguments. Returned values are asserted in full: arrays up to 20 kB,
+   printed one item per line when long; objects by their public properties (and their date for
+   `DateTimeInterface`), not only their class. A case still running after `--case-timeout` seconds
    (default 5: an infinite loop in the code under test, e.g. a negative step) is dropped and the run
    resumes with the next case.
 6. **Selection:** discarded cases are the `TypeError` results caused by testor's own inputs, the cases
@@ -107,8 +118,17 @@ Test names say what the test checks and which input differs from the baseline ca
 Line coverage says what the tests run, not what they check. Mutation testing does: [Infection](https://infection.github.io)
 changes the code (`+` into `-`, `>=` into `>`…) and counts the changes the tests detect (MSI). With
 `.tools/infection.phar`, a phpunit.xml whose test suite is the generated directory, and an infection.json5
-pointing at it (keep both outside the project). Covered code MSI with interaction assertions: 7 phpMyAdmin
-classes with injected dependencies 63 % → 73 %, demo 82 % → 83 %.
+pointing at it (keep both outside the project). Covered code MSI:
+
+| | interaction assertions | + full arrays and object state |
+|---|---|---|
+| 7 phpMyAdmin classes with injected dependencies | 63 % → 73 % | 73 % |
+| 16 phpMyAdmin classes (mostly static helpers) | 52 % → 52 % | **64 %** |
+| demo | 82 % → 83 % | 83 % |
+
+Tried and dropped because they did not pay off on these benchmarks: seeding integer parameters with the
+integer constants of the method (+4 killed mutants for +27 tests), sizes from `substr`/`array_slice`
+arguments, calling with optional arguments left out, round-robin ordering of variations.
 
 These are **characterization tests**: they protect against regressions, but they cannot tell
 whether the current behaviour is correct.

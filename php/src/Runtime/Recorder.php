@@ -7,12 +7,17 @@ namespace Testor\Runtime;
 /**
  * Captures the observed behaviour of a call during the recording pass, and the lines it
  * executed when a coverage driver (PCOV or Xdebug) is available.
- * Results are appended to the JSON file named by TESTOR_RECORD_FILE:
- * {"cases": {id: outcome + "covered": {file: [lines]}}, "executable": {file: [lines]}}.
+ * Results are appended, one JSON line per case, to the file named by TESTOR_RECORD_FILE; read() turns
+ * them into {"cases": {id: outcome + "covered": {file: [lines]}}, "executable": {file: [lines]}}.
  */
 final class Recorder
 {
     private const MAX_EXPORT_LENGTH = 300;
+    /** Values up to this size (single-line export) are asserted in full, pretty-printed. */
+    private const MAX_ASSERTED_LENGTH = 20_000;
+    /** Arrays longer than this on one line are printed one item per line. */
+    private const LINE_WIDTH = 100;
+    private const MAX_ASSERTED_PROPERTIES = 10;
 
     /** @var list<string> files whose lines are measured, null when not measuring */
     private static ?array $files = null;
@@ -130,14 +135,35 @@ final class Recorder
 
         $file = (string) getenv('TESTOR_RECORD_FILE');
         @unlink($file . '.running');
-        $data = is_file($file) ? json_decode((string) file_get_contents($file), true) : [];
-        $data['cases'][$id] = $outcome + ['calls' => self::$calls];
+        $record = ['id' => $id, 'outcome' => $outcome + ['calls' => self::$calls]];
         self::$calls = [];
         if ($lines !== null) {
-            $data['cases'][$id]['covered'] = $lines['covered'];
-            $data['executable'] = array_replace($data['executable'] ?? [], $lines['executable']);
+            $record['outcome']['covered'] = $lines['covered'];
+            $record['executable'] = $lines['executable'];
         }
-        file_put_contents($file, json_encode($data, JSON_PRETTY_PRINT | JSON_PRESERVE_ZERO_FRACTION));
+        // One JSON line per case, appended: rewriting a growing file for every case is quadratic.
+        file_put_contents($file, json_encode($record, JSON_PRESERVE_ZERO_FRACTION) . "\n", FILE_APPEND);
+    }
+
+    /**
+     * Reads a record file written by record(): {cases: id => outcome, executable: file => lines}.
+     *
+     * @return array{cases?: array<string, array>, executable?: array<string, list<int>>}
+     */
+    public static function read(string $file): array
+    {
+        $data = [];
+        foreach (is_file($file) ? file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) : [] as $line) {
+            $record = json_decode($line, true);
+            if (!is_array($record)) {
+                continue; // a line cut short by a killed run
+            }
+            $data['cases'][$record['id']] = $record['outcome'];
+            if (isset($record['executable'])) {
+                $data['executable'] = array_replace($data['executable'] ?? [], $record['executable']);
+            }
+        }
+        return $data;
     }
 
     /** @return array{covered: array<string, list<int>>, executable: array<string, list<int>>}|null */
@@ -172,21 +198,57 @@ final class Recorder
         if (is_float($value) && is_nan($value)) {
             return ['kind' => 'nan'];
         }
-        if (self::isExportable($value)) {
-            $export = self::export($value);
-            if (strlen($export) <= self::MAX_EXPORT_LENGTH) {
-                return ['kind' => 'value', 'export' => $export, 'type' => get_debug_type($value)];
-            }
+        if (self::isExportable($value) && strlen(self::export($value)) <= self::MAX_ASSERTED_LENGTH) {
+            return ['kind' => 'value', 'export' => self::pretty($value), 'type' => get_debug_type($value)];
         }
         if (is_array($value)) {
             return ['kind' => 'array', 'count' => count($value)];
         }
         if (is_object($value)) {
-            $class = get_class($value);
-            return ['kind' => 'object', 'class' => str_contains($class, '@anonymous') ? null : $class];
+            $class = self::doubledType($value) ?? get_class($value);
+            return [
+                'kind' => 'object',
+                'class' => str_contains($class, '@anonymous') ? null : $class,
+                'properties' => self::properties($value),
+                'datetime' => $value instanceof \DateTimeInterface ? $value->format(\DateTimeInterface::ATOM) : null,
+            ];
         }
 
         return ['kind' => 'other', 'type' => get_debug_type($value)];
+    }
+
+    /** Public, initialized properties whose values can be asserted: name => PHP code. */
+    private static function properties(object $value): array
+    {
+        if (self::doubledType($value) !== null) {
+            return [];
+        }
+        $properties = [];
+        foreach (get_object_vars($value) as $name => $property) {
+            if (self::isExportable($property) && strlen(self::export($property)) <= self::MAX_EXPORT_LENGTH) {
+                $properties[$name] = self::pretty($property);
+                if (count($properties) === self::MAX_ASSERTED_PROPERTIES) {
+                    break;
+                }
+            }
+        }
+        return $properties;
+    }
+
+    /** Export on one line, or one array item per line (4-space indents) when too wide. */
+    private static function pretty(mixed $value, int $indent = 0): string
+    {
+        $flat = self::export($value);
+        if (!is_array($value) || $value === [] || strlen($flat) + $indent <= self::LINE_WIDTH) {
+            return $flat;
+        }
+        $isList = array_is_list($value);
+        $pad = str_repeat(' ', $indent + 4);
+        $lines = [];
+        foreach ($value as $key => $item) {
+            $lines[] = $pad . ($isList ? '' : var_export($key, true) . ' => ') . self::pretty($item, $indent + 4) . ',';
+        }
+        return "[\n" . implode("\n", $lines) . "\n" . str_repeat(' ', $indent) . ']';
     }
 
     private static function isExportable(mixed $value): bool
@@ -214,8 +276,17 @@ final class Recorder
             is_float($value) && is_infinite($value) => $value > 0 ? 'INF' : '-INF',
             $value instanceof \UnitEnum => '\\' . get_class($value) . '::' . $value->name,
             is_array($value) => self::exportArray($value),
+            is_string($value) && preg_match('/[\x00-\x1F\x7F]/', $value) === 1 => self::doubleQuoted($value),
             default => var_export($value, true),
         };
+    }
+
+    /** "line\n" rather than a literal spanning lines: exports always fit on one line. */
+    private static function doubleQuoted(string $value): string
+    {
+        $escaped = addcslashes($value, "\\\"\$\n\r\t\v\f\e");
+        $escaped = preg_replace_callback('/[\x00-\x1F\x7F]/', fn (array $m) => sprintf('\\x%02X', ord($m[0])), $escaped);
+        return '"' . $escaped . '"';
     }
 
     private static function exportArray(array $value): string

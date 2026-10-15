@@ -165,6 +165,27 @@ final class GeneratorTest extends DemoProjectTestCase
         $this->assertStringContainsString("->method('charge')->with(3.0)", $source);
     }
 
+    public function testParallelGenerationWritesTheSameFilesAsSequential(): void
+    {
+        if (!function_exists('pcntl_fork')) {
+            $this->markTestSkipped('needs ext-pcntl');
+        }
+        $out = Process::tempDir();
+        try {
+            $reports = (new Generator(self::demo(), $out, jobs: 4))->generate([self::demo() . '/src']);
+            $this->assertSame(array_keys(self::$reports), array_map(fn (ClassReport $r) => $r->name, $reports), 'same order');
+            foreach ($reports as $report) {
+                $sequential = self::$reports[$report->name];
+                $this->assertSame($sequential->kept, $report->kept, $report->name);
+                if ($report->output !== null) {
+                    $this->assertFileEquals((string) $sequential->output, $report->output);
+                }
+            }
+        } finally {
+            Process::removeDir($out);
+        }
+    }
+
     public function testMethodsWithSideEffectsAreSkipped(): void
     {
         $this->assertContains(['export', 'side effects: file_put_contents'], self::$reports['App\Io\CsvExporter']->skipped);
