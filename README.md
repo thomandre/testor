@@ -154,3 +154,10 @@ vendor/bin/phpunit --testsuite unit      # unit only, no external process
   rendering and the Recorder.
 - **Integration tests** (`tests/Integration/`): Reflection worker and the full pipeline on
   `examples/php-demo`. They are skipped if that project's `vendor/` is missing.
+
+## License
+
+testor is released under the [MIT License](LICENSE).
+
+The tests testor generates are yours: the license covers the tool, not what it produces from your code.
+You can use, modify and license the generated tests however you like, without attribution.
