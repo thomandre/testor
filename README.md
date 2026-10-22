@@ -27,8 +27,26 @@ independent, so they are generated in parallel (forked processes, biggest classe
 without ext-pcntl), with exactly the same output as a sequential run. On 16 phpMyAdmin classes:
 14.8 s → 4.7 s for 279 tests (2,370 lines of test code).
 
-**Against a project's own tests:** on those 16 classes, phpMyAdmin's unit tests cover 74.9 % of the lines,
-testor's 67.1 %, and both together 88.8 %: testor covers 174 lines the project's tests do not.
+**Against a project's own tests:**
+
+| project | project's tests | testor (time) | both |
+|---|---|---|---|
+| phpMyAdmin, 16 classes | 74.9 % | 67.1 % (4.7 s, 279 tests) | 88.8 % (+174 lines) |
+| [dompdf](https://github.com/dompdf/dompdf), all of `src/` (79 files) | 57.8 % | 30.4 % (16.6 s, 1,432 tests) | 66.3 % (+898 lines) |
+
+dompdf is harder (nested frames, styles, canvas): 19 of its 79 classes get no test yet. 10 of them declare
+no method of their own; the others have methods that all need a rendering context, or static state that
+depends on test order. On dompdf, testor alone went from 13.8 % to 30.4 % through: abstract classes and
+protected methods (+8.6 points), destructured arrays and real DOM nodes (+3.2), real objects instead of
+stubs (+2.9), calls preparing the state (+1.8).
+
+Where the lines testor misses are (dompdf, 10,588 executable lines): 1,042 in classes without tests, 2,933
+in methods never run (their cases fail on an unrealistic state, or they have side effects), 3,397 in
+branches not reached in methods that do run.
+
+**Legacy code:** when a parameter or return value has no native type, its PHPDoc type (`@param`, `@return`)
+is used. PHPUnit doubles cannot derive a return value from a PHPDoc type, so such methods return a real
+object when it can be built without arguments, else an explicit stub.
 
 **Coverage:** with PCOV (recommended, `pecl install pcov`) or Xdebug in coverage mode, testor measures
 the lines each case executes and reports line coverage for every tested class. Without a coverage driver,
@@ -49,10 +67,21 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
    no dependency on testor's packages. It provides exact signatures, resolves class constant values, and
    builds a registry of the referenced types: how to construct them, and the return type of each method
    of the stubbable ones.
-3. **Inputs:** for each public method, a baseline call, then one input varied at a time.
-   - **Objects:** interfaces and non-final classes are replaced with PHPUnit stubs. Final classes are built
-     with their public constructor or a static factory (`from(): static`), using baseline values for the
-     required arguments, recursively (two levels). The class under test is built the same way.
+3. **Inputs:** for each public or protected method, a baseline call, then one input varied at a time.
+   - **Protected methods** are called through a closure bound to the instance:
+     `(fn () => $this->capped(1.5))->call($sut)`.
+   - **Abstract classes** are instantiated as a PHPUnit partial mock that implements only their abstract
+     methods: `$this->getMockBuilder(Discount::class)->setConstructorArgs([1.5])->onlyMethods(['rate'])->getMock()`.
+   - **Objects:** interfaces and non-final classes are replaced with PHPUnit stubs; like EvoSuite, concrete
+     classes also get a real object as another option, since a stub has no state at all. Final classes are
+     built with their public constructor or a static factory (`from(): static`), using baseline values for
+     the required arguments, recursively (real objects all the way down, up to four levels). The class under
+     test is built the same way. DOM nodes are created from a document (`(new DOMDocument())->createElement('div')`):
+     a double of a DOM class has no underlying node.
+   - **Calls preparing the state:** EvoSuite builds call sequences; testor targets them. A method of the
+     class that writes a property the tested method reads (`$sut->setWidth(10)` before `$sut->area()`,
+     found by static analysis, also through private methods) is an extra input: no call, or that call with
+     a few values.
    - **Stub return values:** the static analysis finds which methods of each dependency are called
      (`$this->repo->find()`, `$param->charge()`, also through private methods and in the constructor).
      Their return values are extra inputs, configured with `->method('find')->willReturn(…)` and varied like
@@ -70,6 +99,17 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
      gives a matching string (generated, then checked with `preg_match`), and so on for `json_decode`,
      `strtotime`/`new DateTime`, `explode`, `str_starts_with`, `ctype_*`… `strlen($x) > 10` and `count($x) >= 3`
      give the boundary lengths.
+   - **Array shapes:** the keys the code reads on an array (`$p['name']`, `isset($p['x'])`, `array_key_exists`)
+     give an array with those keys. The value of each key comes from how the code uses it: comparisons
+     and formats as above, casts (`(bool) $p['x']`: `true`), or fallbacks (`$p['n'] ?? 0`: `1`; `?? $this->x`:
+     a value of the property's type), arithmetic (a number). Destructuring (`[$top, $right] = $widths`) gives
+     positional keys, and `$$side` gets the names of the destructured variables. Nested reads (`$p['a']['b']`) give nested arrays, and
+     `foreach ($rows as $row)` gives a list of shapes. Keys are also collected from the private methods
+     the value is passed to (`$this->setFormat($settings)`), so a constructor taking `array $settings = []`
+     gets one array with every key. Optional parameters with such an inferred domain are explored instead
+     of being left out. Arrays longer than 100 characters go in a variable, one entry per line. On the 25
+     phpMyAdmin files that read the most keys on their parameters, line coverage goes from 45.5 % to 53.1 %
+     (`Config\Settings\Schema`: 80 % → 100 %).
    - **Exceptions from dependencies:** when the tested method catches exceptions, each called dependency
      method also gets a `->willThrowException(…)` option, to cover the `catch` blocks.
 
@@ -86,7 +126,7 @@ The target project needs `vendor/autoload.php` and `phpunit/phpunit` (10+).
    call made to dependencies with its arguments. Returned values are asserted in full: arrays up to 20 kB,
    printed one item per line when long; objects by their public properties (and their date for
    `DateTimeInterface`), not only their class. A case still running after `--case-timeout` seconds
-   (default 5: an infinite loop in the code under test, e.g. a negative step) is dropped and the run
+   (default 2: an infinite loop in the code under test, e.g. a negative step) is dropped and the run
    resumes with the next case.
 6. **Selection:** discarded cases are the `TypeError` results caused by testor's own inputs, the cases
    that raise warnings, notices or deprecations, and those that time out. Among the remaining cases, a case
@@ -128,7 +168,9 @@ pointing at it (keep both outside the project). Covered code MSI:
 
 Tried and dropped because they did not pay off on these benchmarks: seeding integer parameters with the
 integer constants of the method (+4 killed mutants for +27 tests), sizes from `substr`/`array_slice`
-arguments, calling with optional arguments left out, round-robin ordering of variations.
+arguments, calling with optional arguments left out, round-robin ordering of variations, varying what
+the abstract methods called by a template method return (+1 line on phpMyAdmin's 37 abstract classes),
+allowing side effects (no gain on dompdf: those methods fail on the object's state anyway).
 
 These are **characterization tests**: they protect against regressions, but they cannot tell
 whether the current behaviour is correct.

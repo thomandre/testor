@@ -18,6 +18,11 @@ final class CaseBuilder
 {
     /** @var array<string, array> method name => input space */
     private array $spaces = [];
+    /** Methods tried, one at a time, as a call preparing the instance's state before the tested one. */
+    private const MAX_PREPARING_METHODS = 4;
+    /** Values tried for the first parameter of a preparing method. */
+    private const MAX_PREPARING_VALUES = 3;
+
     /** @var array<string, true> "method:choice" already generated */
     private array $tried = [];
     private int $nextId = 0;
@@ -105,15 +110,22 @@ final class CaseBuilder
         // Values of each parameter slot, then the stub configuration from the return dimensions.
         $vals = [];
         $variations = [];
+        $before = [];
         foreach ($space['dims'] as $i => $dim) {
             $option = $dim['options'][$choice[$i]];
             if ($choice[$i] !== 0) {
                 $variations[] = $dim['labels'][$choice[$i]];
             }
+            if ($dim['kind'] === 'before') {
+                if ($option !== null) {
+                    $before[] = $option;
+                }
+                continue;
+            }
             $slot = $dim['target'] . ':' . $dim['name'];
             if ($dim['kind'] === 'value') {
-                $vals[$slot] = ($dim['spied'] ?? []) === [] ? $option : $option->withSpied($dim['spied']);
-            } else {
+                $vals[$slot] = ($dim['spied'] ?? []) === [] || !$option->isStub() ? $option : $option->withSpied($dim['spied']);
+            } elseif ($vals[$slot]->isStub()) {
                 $vals[$slot] = $vals[$slot]->configured($dim['method'], $option['returns'], $option['throws']);
             }
         }
@@ -130,10 +142,11 @@ final class CaseBuilder
         return new Scenario(
             'c' . $this->nextId++,
             $space['method'],
-            $space['factory'] === false ? null : new Construction($space['factory'], $ctorArgs),
+            $space['factory'] === false ? null : new Construction($space['factory'], $ctorArgs, $space['abstract']),
             $args,
             $choice,
             array_values(array_filter($variations)),
+            $before,
         );
     }
 
@@ -160,6 +173,9 @@ final class CaseBuilder
             $slots[] = ['ctor', $name];
             array_push($dims, ...$this->slotDims('ctor', $name, $vals, $type, $called, $domains, $method, $imports));
         }
+        if ($construction !== null) {
+            array_push($dims, ...$this->preparingDims($class, $method, $imports));
+        }
         foreach ($params as [$name, $vals, $type]) {
             $called = $method['calls']['variable'][$name] ?? [];
             $domains = $method['returnDomains']['variable'][$name] ?? [];
@@ -169,6 +185,7 @@ final class CaseBuilder
         return [
             'method' => $method,
             'factory' => $construction === null ? false : $construction[0],
+            'abstract' => $class['kind'] === 'abstract' ? $class['abstractMethods'] ?? [] : null,
             'slots' => $slots,
             'dims' => $dims,
         ];
@@ -226,6 +243,50 @@ final class CaseBuilder
         return $dims;
     }
 
+    /**
+     * Like EvoSuite's call sequences, but targeted: a method of the class that writes a property the tested
+     * method reads ($this->setWidth(10) before $this->area()) prepares a state a constructor alone may not
+     * give. One dimension: no call (baseline), or one of these calls with a few values.
+     */
+    private function preparingDims(array $class, array $method, Imports $imports): array
+    {
+        $reads = array_flip($method['reads'] ?? []);
+        if ($reads === []) {
+            return [];
+        }
+        $options = [null];
+        $labels = [''];
+        $count = 0;
+        foreach ($class['methods'] as $other) {
+            if ($other['name'] === $method['name'] || $other['static'] || $other['sideEffects'] !== []
+                || array_intersect_key(array_flip($other['writes'] ?? []), $reads) === []) {
+                continue;
+            }
+            $params = $this->methodCandidates($other, $imports);
+            if (is_string($params)) {
+                continue;
+            }
+            // Real objects first: a stub passed to it would carry no state at all.
+            $params = array_map(fn (array $p) => [$p[0], [...array_filter($p[1], fn (Val $v) => !$v->isStub()),
+                ...array_filter($p[1], fn (Val $v) => $v->isStub())], $p[2]], $params);
+            if (++$count > self::MAX_PREPARING_METHODS) {
+                break;
+            }
+            $firsts = $params === [] ? [null] : array_slice($params[0][1], 0, self::MAX_PREPARING_VALUES);
+            foreach ($firsts as $first) {
+                $args = [];
+                foreach ($params as $i => [$name, $vals]) {
+                    $args[] = new Arg($name, $i === 0 ? $first : $vals[0]);
+                }
+                $options[] = ['method' => $other, 'args' => $args];
+                $labels[] = 'After' . ucfirst($other['name']) . ($first === null ? '' : Labels::value($first->expr));
+            }
+        }
+        return count($options) > 1
+            ? [['kind' => 'before', 'target' => 'sut', 'name' => '', 'options' => $options, 'labels' => $labels]]
+            : [];
+    }
+
     /** "Level" + "LevelWarning" => "LevelWarning", not "LevelLevelWarning". */
     private static function withoutPrefix(string $label, string $name): string
     {
@@ -260,7 +321,7 @@ final class CaseBuilder
             }
             $reason = $args;
         }
-        foreach ($class['methods'] as $method) {
+        foreach ($class['kind'] === 'abstract' ? [] : $class['methods'] as $method) {
             if ($method['factory'] && $method['sideEffects'] === []) {
                 $args = $this->requiredCandidates($method['params'], "{$method['name']}()", $imports);
                 if (!is_string($args)) {
@@ -272,7 +333,8 @@ final class CaseBuilder
     }
 
     /**
-     * Required parameters only (optional ones keep their default), with all their candidates.
+     * Required parameters, with all their candidates; optional ones keep their default, unless the code
+     * shows what they hold (an inferred domain: the keys read on an `array $options = []`…).
      *
      * @return list<array{string, list<Val>, ?array}>|string
      */
@@ -280,7 +342,7 @@ final class CaseBuilder
     {
         $args = [];
         foreach ($params as $p) {
-            if ($p['optional'] || $p['variadic']) {
+            if ($p['variadic'] || ($p['optional'] && ($p['domain'] ?? null) === null)) {
                 break;
             }
             if ($p['byRef']) {

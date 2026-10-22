@@ -86,11 +86,12 @@ final class GeneratorTest extends DemoProjectTestCase
     {
         $source = $this->generated('App\Orders\OrderService');
 
+        $this->assertStringContainsString("\$orders->method('find')->willReturn(null);", $source);
         $this->assertStringContainsString("\$orders->expects(\$this->once())->method('find')->with(1)->willReturn(null);", $source);
         $this->assertStringContainsString("\$this->expectExceptionMessage('Order 1 not found');", $source);
-        $this->assertStringContainsString("\$payments->expects(\$this->once())->method('charge')->with(3.0)->willReturn(false);", $source);
+        $this->assertStringContainsString("\$payments->method('charge')->willReturn(false);", $source);
         $this->assertStringContainsString("\$this->assertSame('declined', \$sut->pay(1));", $source);
-        $this->assertStringContainsString("\$orders->expects(\$this->once())->method('find')->with(1)->willReturn(new Order(1, 1.5));", $source);
+        $this->assertStringContainsString("\$orders->method('find')->willReturn(new Order(1, 1.5));", $source);
         if (\Testor\Runtime\Recorder::driver() !== null) {
             $this->assertGreaterThanOrEqual(90.0, self::$reports['App\Orders\OrderService']->coverage());
         }
@@ -99,12 +100,12 @@ final class GeneratorTest extends DemoProjectTestCase
     public function testOptionalArgumentsAndCrossClassThresholds(): void
     {
         $this->assertStringContainsString(
-            "\$orders->expects(\$this->once())->method('find')->with(1)->willReturn(new Order(1, 1.5, status: OrderStatus::Paid));",
+            "\$orders->method('find')->willReturn(new Order(1, 1.5, status: OrderStatus::Paid));",
             $this->generated('App\Orders\OrderService'),
         );
         $this->assertStringContainsString("\$this->assertSame('already processed', \$sut->pay(1));", $this->generated('App\Orders\OrderService'));
         $this->assertStringContainsString(
-            "\$basket->expects(\$this->once())->method('itemCount')->willReturn(3);",
+            "\$basket->method('itemCount')->willReturn(3);",
             $this->generated('App\Orders\CheckoutService'),
             'threshold of ShippingPolicy::isFree()',
         );
@@ -129,7 +130,7 @@ final class GeneratorTest extends DemoProjectTestCase
     public function testDependencyExceptionsCoverCatchBlocks(): void
     {
         $this->assertStringContainsString(
-            "\$basket->expects(\$this->once())->method('itemCount')->willThrowException(new RuntimeException('testor'));",
+            "\$basket->method('itemCount')->willThrowException(new RuntimeException('testor'));",
             $this->generated('App\Orders\CheckoutService'),
         );
         $this->assertStringContainsString('public function testItemsOrZeroReturns0WhenItemCountThrows(): void', $this->generated('App\Orders\CheckoutService'));
@@ -197,7 +198,21 @@ final class GeneratorTest extends DemoProjectTestCase
     {
         $this->assertSame('enum: skipped', self::$reports['App\Pricing\CustomerTier']->error);
         $this->assertSame('interface: skipped', self::$reports['App\Pricing\TaxRateProvider']->error);
-        $this->assertSame('abstract: skipped', self::$reports['App\Io\AbstractExporter']->error);
+        // Its only method writes a file: nothing left to test.
+        $this->assertSame('no testable method', self::$reports['App\Io\AbstractExporter']->error);
+    }
+
+    public function testAbstractClassesAreTestedThroughAPartialMock(): void
+    {
+        $code = $this->generated('App\Pricing\Discount');
+        $this->assertStringContainsString("\$this->getMockBuilder(Discount::class)->setConstructorArgs([", $code);
+        $this->assertStringContainsString("->onlyMethods(['rate'])->getMock();", $code);
+        $this->assertStringContainsString('$this->expectException(InvalidArgumentException::class);', $code);
+    }
+
+    public function testProtectedMethodsAreCalledThroughABoundClosure(): void
+    {
+        $this->assertStringContainsString('(fn () => $this->capped(', $this->generated('App\Pricing\Discount'));
     }
 
     public function testLineCoverageIsReportedPerClass(): void

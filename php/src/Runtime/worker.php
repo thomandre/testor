@@ -114,7 +114,7 @@ function describeClass(string $name, int $depth): array
         } elseif (!$m->isStatic() && !$m->isConstructor() && !$ref->isFinal() && $depth < MAX_METHODS_DEPTH) {
             $info['methods'][strtolower($m->getName())] = [
                 'name' => $m->getName(),
-                'returnType' => describeType($m->getReturnType(), $depth + 1),
+                'returnType' => describeType($m->getReturnType(), $depth + 1) ?? docType($m, null, $depth + 1),
             ];
         }
     }
@@ -149,11 +149,102 @@ function describeType(?ReflectionType $type, int $depth = 0): ?array
     return ['kind' => 'intersection'];
 }
 
+/**
+ * Type from PHPDoc (@return, or @param for $param) when there is no native type: legacy code often
+ * only documents its types. Returns a descriptor like describeType(), or null if absent or unusable.
+ */
+function docType(ReflectionFunctionAbstract $fn, ?string $param, int $depth): ?array
+{
+    $doc = (string) $fn->getDocComment();
+    $pattern = $param === null
+        ? '/@return\s+([^\s*]+)/'
+        : '/@param\s+([^\s*$]+)\s+(?:\.\.\.)?\$' . preg_quote($param, '/') . '\b/';
+    if (!preg_match($pattern, $doc, $m)) {
+        return null;
+    }
+    $class = $fn instanceof ReflectionMethod ? $fn->getDeclaringClass() : null;
+    $members = [];
+    $nullable = false;
+    foreach (preg_split('/\|(?![^<]*>)/', preg_replace('/<.*>|\{.*\}/', '', $m[1])) as $member) {
+        $member = trim($member);
+        if (str_starts_with($member, '?')) {
+            $nullable = true;
+            $member = substr($member, 1);
+        }
+        $lower = strtolower($member);
+        $name = match (true) {
+            $lower === 'null' => null,
+            str_ends_with($member, '[]') => 'array',
+            in_array($lower, ['int', 'integer'], true) => 'int',
+            in_array($lower, ['bool', 'boolean'], true) => 'bool',
+            in_array($lower, ['float', 'double'], true) => 'float',
+            in_array($lower, ['string', 'array', 'iterable', 'callable', 'object', 'void', 'false', 'true'], true) => $lower,
+            in_array($lower, ['$this', 'static', 'self'], true) => 'static',
+            in_array($lower, ['mixed', 'resource'], true) => '',
+            default => resolveDocClass($member, $class),
+        };
+        if ($name === null) {
+            $nullable = true;
+        } elseif ($name === '') {
+            return null; // mixed/unknown: no better than no type
+        } else {
+            $builtin = in_array($name, ['int', 'bool', 'float', 'string', 'array', 'iterable', 'callable', 'object', 'void', 'false', 'true'], true);
+            if (!$builtin && $name !== 'static') {
+                reference($name, $depth);
+            }
+            $members[] = ['kind' => 'named', 'name' => $name, 'builtin' => $builtin, 'nullable' => false];
+        }
+    }
+    if ($members === []) {
+        return null;
+    }
+    // 'doc': PHPUnit doubles cannot derive a default return value from a PHPDoc-only type.
+    if (count($members) === 1) {
+        return [...$members[0], 'nullable' => $nullable, 'doc' => true];
+    }
+    return ['kind' => 'union', 'types' => $members, 'nullable' => $nullable, 'doc' => true];
+}
+
+/** FQCN of a class named in a docblock, resolved like PHP would (imports, namespace), or '' if unknown. */
+function resolveDocClass(string $name, ?ReflectionClass $context): string
+{
+    static $imports = [];
+    $candidates = [];
+    if ($name[0] === '\\') {
+        $candidates[] = ltrim($name, '\\');
+    } elseif ($context !== null) {
+        $file = (string) $context->getFileName();
+        if (!isset($imports[$file])) {
+            preg_match_all('/^use\s+([\w\\\\]+)(?:\s+as\s+(\w+))?\s*;/mi', (string) @file_get_contents($file), $uses, PREG_SET_ORDER);
+            $imports[$file] = [];
+            foreach ($uses as $use) {
+                $alias = ($use[2] ?? '') !== '' ? $use[2] : substr($use[1], (int) strrpos('\\' . $use[1], '\\'));
+                $imports[$file][strtolower($alias)] = ltrim($use[1], '\\');
+            }
+        }
+        [$first] = explode('\\', $name);
+        if (isset($imports[$file][strtolower($first)])) {
+            $candidates[] = $imports[$file][strtolower($first)] . substr($name, strlen($first));
+        }
+        $candidates[] = ltrim($context->getNamespaceName() . '\\' . $name, '\\');
+    }
+    $candidates[] = $name;
+    foreach ($candidates as $candidate) {
+        try {
+            if (class_exists($candidate) || interface_exists($candidate) || enum_exists($candidate)) {
+                return (new ReflectionClass($candidate))->getName();
+            }
+        } catch (Throwable) {
+        }
+    }
+    return '';
+}
+
 function describeParams(ReflectionFunctionAbstract $fn, int $depth = 0): array
 {
     return array_map(fn (ReflectionParameter $p) => [
         'name' => $p->getName(),
-        'type' => describeType($p->getType(), $depth),
+        'type' => describeType($p->getType(), $depth) ?? docType($fn, $p->getName(), $depth),
         'optional' => $p->isOptional(),
         'variadic' => $p->isVariadic(),
         'byRef' => $p->isPassedByReference(),
@@ -263,7 +354,8 @@ foreach ($request['files'] as $file) {
             $ref = new ReflectionClass($className);
             $ctor = $ref->getConstructor();
             $methods = [];
-            foreach ($ref->getMethods(ReflectionMethod::IS_PUBLIC) as $m) {
+            // Protected methods too: tests call them through a closure bound to the instance.
+            foreach ($ref->getMethods(ReflectionMethod::IS_PUBLIC | ReflectionMethod::IS_PROTECTED) as $m) {
                 if ($m->getDeclaringClass()->getName() !== $ref->getName()
                     || $m->isAbstract() || str_starts_with($m->getName(), '__')) {
                     continue;
@@ -271,8 +363,9 @@ foreach ($request['files'] as $file) {
                 $methods[] = [
                     'name' => $m->getName(),
                     'static' => $m->isStatic(),
+                    'protected' => $m->isProtected(),
                     'params' => describeParams($m),
-                    'returnType' => describeType($m->getReturnType()),
+                    'returnType' => describeType($m->getReturnType()) ?? docType($m, null, 0),
                     'factory' => $m->isStatic() && returnsSelf($m, $ref),
                 ];
             }
@@ -288,6 +381,10 @@ foreach ($request['files'] as $file) {
                 },
                 'constructor' => $ctor && $ctor->isPublic() ? describeParams($ctor) : ($ctor ? null : []),
                 'methods' => $methods,
+                // An abstract class is tested through a partial mock implementing these methods.
+                'abstractMethods' => $ref->isAbstract() && !$ref->isInterface() && !$ref->isTrait()
+                    ? array_values(array_map(fn ($m) => $m->getName(), array_filter($ref->getMethods(), fn ($m) => $m->isAbstract())))
+                    : [],
                 'ancestorFiles' => ancestorFiles($ref),
                 'startLine' => $ref->getStartLine(),
                 'endLine' => $ref->getEndLine(),

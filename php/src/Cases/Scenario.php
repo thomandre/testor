@@ -11,6 +11,7 @@ final readonly class Scenario
      * @param list<Arg> $args
      * @param list<int> $choice index of the option chosen in each dimension of the method's input space
      * @param list<string> $variations labels of the options that differ from the baseline (for test names)
+     * @param list<array{method: array, args: list<Arg>}> $before calls on the instance before the tested one
      */
     public function __construct(
         public string $id,
@@ -19,6 +20,7 @@ final readonly class Scenario
         public array $args,
         public array $choice = [],
         public array $variations = [],
+        public array $before = [],
     ) {
     }
 }

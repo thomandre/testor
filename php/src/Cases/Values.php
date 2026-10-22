@@ -32,6 +32,20 @@ final class Values
         'DateTime' => 'DateTime',
     ];
 
+    /**
+     * DOM nodes: a PHPUnit double of a DOM class has no underlying node ("Invalid State Error" on first
+     * use), and `new DOMElement()` gives a read-only node: they are created from a document instead.
+     */
+    private const DOM_CLASSES = [
+        'DOMNode' => "createElement('div')",
+        'DOMElement' => "createElement('div')",
+        'DOMText' => "createTextNode('testor')",
+        'DOMCharacterData' => "createTextNode('testor')",
+        'DOMComment' => "createComment('testor')",
+        'DOMAttr' => "createAttribute('testor')",
+        'DOMDocumentFragment' => 'createDocumentFragment()',
+    ];
+
     /** Which recorded value types each declared builtin type accepts (strict_types on). */
     private const ACCEPTS = [
         'string' => ['string'], 'int' => ['int'], 'float' => ['int', 'float'], 'bool' => ['bool'],
@@ -74,7 +88,8 @@ final class Values
     /** True when values of this type are PHPUnit stubs (interfaces, abstract and non-final classes). */
     public function isStubbable(?array $type): bool
     {
-        if ($type === null || $type['kind'] !== 'named' || $type['builtin'] || isset(self::DATE_CLASSES[$type['name']])) {
+        if ($type === null || $type['kind'] !== 'named' || $type['builtin'] || isset(self::DATE_CLASSES[$type['name']])
+            || isset(self::DOM_CLASSES[$type['name']]) || $type['name'] === 'DOMDocument') {
             return false;
         }
         $info = $this->type($type['name']);
@@ -127,6 +142,14 @@ final class Values
             return [];
         }
         if ($this->isStubbable($type)) {
+            if ($type['doc'] ?? false) {
+                // Typed in PHPDoc only: PHPUnit would return null, so return an object explicitly — a real
+                // one when it can be built (no chain of null-returning doubles), else a stub.
+                $alias = $imports->ref($type['name']);
+                $built = $this->build($this->type($type['name']), $alias, $imports, 1);
+                $object = new Val($built[0] ?? "\$this->createStub($alias::class)");
+                return $type['nullable'] ? [$object, new Val('null')] : [$object];
+            }
             return $type['nullable'] ? [null, new Val('null')] : [];
         }
         // The generic baseline first: domain values are often failure checks (`=== false`) that end the
@@ -233,6 +256,10 @@ final class Values
             $cls = $imports->ref(self::DATE_CLASSES[$name]);
             return [new Val("new $cls('2024-01-15 10:30:00')", $hoist)];
         }
+        if (isset(self::DOM_CLASSES[$name]) || $name === 'DOMDocument') {
+            $document = '(new ' . $imports->ref('DOMDocument') . '())';
+            return [new Val(isset(self::DOM_CLASSES[$name]) ? "$document->" . self::DOM_CLASSES[$name] : $document, $hoist)];
+        }
 
         $info = $this->type($name);
         if ($info === null) {
@@ -243,8 +270,21 @@ final class Values
             return array_map(fn (string $case) => new Val("$alias::$case"), $info['enumCases']) ?: null;
         }
         if (!$info['isFinal']) {
-            // PHPUnit stubs; return values are configured by the case builder.
-            return [new Val("\$this->createStub($alias::class)", $hoist)];
+            // Nested in another object, a stub is never configured: a real object behaves more like the
+            // code expects, when the class can be built without arguments.
+            if ($depth > 0 && !$info['isInterface'] && !$info['isAbstract']) {
+                $built = $this->build($info, $alias, $imports, $depth);
+                if ($built !== []) {
+                    return [new Val($built[0])];
+                }
+            }
+            // PHPUnit stubs; return values are configured by the case builder. Then, like EvoSuite, real
+            // objects of the class: their state is consistent, where a stub's is empty.
+            $stub = new Val("\$this->createStub($alias::class)", $hoist);
+            $real = $depth === 0 && !$info['isInterface'] && !$info['isAbstract']
+                ? array_slice($this->build($info, $alias, $imports, $depth), 0, 1)
+                : [];
+            return [$stub, ...array_map(fn (string $expr) => new Val($expr, $hoist), $real)];
         }
         $built = $this->build($info, $alias, $imports, $depth);
         return $built === [] ? null : array_map(fn (string $expr) => new Val($expr, $hoist), $built);

@@ -89,6 +89,25 @@ final class ValuesTest extends TestCase
         $this->assertFalse($this->values()->isStubbable(self::builtin('int')));
     }
 
+    public function testOpenConcreteClassesAlsoGetARealObject(): void
+    {
+        $this->register('App\\Sheet', ['constructor' => [self::param('name', self::builtin('string'))]]);
+        $style = $this->register('App\\Style', ['constructor' => [self::param('sheet', self::classType('App\\Sheet'))]]);
+
+        $this->assertSame(
+            ['$this->createStub(Style::class)', "new Style(new Sheet('testor'))"],
+            $this->exprs($style),
+            'nested objects are real ones too, when they can be built',
+        );
+    }
+
+    public function testDomNodesAreCreatedFromADocument(): void
+    {
+        $this->assertSame(["(new DOMDocument())->createElement('div')"], $this->exprs(self::classType('DOMElement')));
+        $this->assertSame(["(new DOMDocument())->createTextNode('testor')"], $this->exprs(self::classType('DOMText')));
+        $this->assertFalse($this->values()->isStubbable(self::classType('DOMNode')));
+    }
+
     public function testFinalClassesAreBuiltWithBaselineArguments(): void
     {
         $money = $this->register('App\Money', ['isFinal' => true, 'constructor' => [

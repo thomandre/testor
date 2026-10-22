@@ -22,8 +22,46 @@ final class Recorder
     /** @var list<string> files whose lines are measured, null when not measuring */
     private static ?array $files = null;
 
-    /** @var list<array{string, string, list<array>}> calls seen by spies: [stub key, method, arguments] */
+    /** @var list<array{string, string, list<array>}> calls made by the tested call: [stub key, method, arguments] */
     private static array $calls = [];
+
+    /** False while the object under test is being built: calls made then are not asserted. */
+    private static bool $calling = false;
+
+    /** @var list<string> PHP warnings, notices and deprecations since start() */
+    private static array $notices = [];
+    /** error_reporting() level to restore, null when not watching */
+    private static ?int $level = null;
+
+    /**
+     * Collects PHP warnings/notices/deprecations. Test runners may lower error_reporting (PHPUnit 12
+     * does): E_ALL is forced so that only errors silenced with @ (masked down to fatal errors) are ignored.
+     */
+    private static function watch(): void
+    {
+        if (self::$level !== null) {
+            return;
+        }
+        self::$notices = [];
+        self::$level = error_reporting(E_ALL);
+        set_error_handler(static function (int $errno, string $message, string $file, int $line): bool {
+            if (!(error_reporting() & $errno)) {
+                return false; // silenced with @
+            }
+            self::$notices[] = "$message ($file:$line)";
+            return true;
+        });
+    }
+
+    private static function unwatch(): void
+    {
+        if (self::$level === null) {
+            return;
+        }
+        restore_error_handler();
+        error_reporting(self::$level);
+        self::$level = null;
+    }
 
     /**
      * Callback for a stubbed method (->willReturnCallback()): records the call and its arguments,
@@ -32,7 +70,9 @@ final class Recorder
     public static function spy(string $stub, string $method, \Closure $value): \Closure
     {
         return static function (mixed ...$args) use ($stub, $method, $value): mixed {
-            self::$calls[] = [$stub, $method, array_map(self::argument(...), array_values($args))];
+            if (self::$calling) {
+                self::$calls[] = [$stub, $method, array_map(self::argument(...), array_values($args))];
+            }
             return $value();
         };
     }
@@ -85,6 +125,10 @@ final class Recorder
         file_put_contents(getenv('TESTOR_RECORD_FILE') . '.running', $id);
         self::$files = null;
         self::$calls = [];
+        self::$calling = false;
+        // Warnings while building the object count too: PHPUnit reports them for the final test.
+        self::unwatch();
+        self::watch();
         if (self::driver() === 'pcov') {
             \pcov\clear();
             \pcov\start();
@@ -108,26 +152,18 @@ final class Recorder
 
     public static function record(string $id, callable $call): void
     {
-        $notices = [];
-        // Test runners may lower error_reporting (PHPUnit 12 does): force E_ALL so that only
-        // errors silenced with @ (which masks it down to fatal errors) are ignored.
-        $level = error_reporting(E_ALL);
-        set_error_handler(static function (int $errno, string $message, string $file, int $line) use (&$notices): bool {
-            if (!(error_reporting() & $errno)) {
-                return false; // silenced with @
-            }
-            $notices[] = "$message ($file:$line)";
-            return true;
-        });
+        self::watch(); // already watching since start(), unless called without it
+        self::$calling = true;
         try {
             $outcome = self::describe($call());
         } catch (\Throwable $e) {
             $outcome = ['kind' => 'throws', 'class' => get_class($e), 'message' => $e->getMessage()];
         } finally {
-            restore_error_handler();
-            error_reporting($level);
+            self::unwatch();
+            self::$calling = false;
             $lines = self::stop();
         }
+        $notices = self::$notices;
         if ($notices !== []) {
             // Warnings/notices/deprecations usually mean the code depends on missing global state.
             $outcome = ['kind' => 'notice', 'notices' => $notices];

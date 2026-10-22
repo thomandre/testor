@@ -24,6 +24,12 @@ final readonly class Val
     ) {
     }
 
+    /** A PHPUnit stub, whose methods can be configured (not a real object). */
+    public function isStub(): bool
+    {
+        return str_starts_with($this->expr, '$this->createStub(');
+    }
+
     /** @return list<string> methods whose calls are recorded and asserted */
     public function spiedMethods(): array
     {

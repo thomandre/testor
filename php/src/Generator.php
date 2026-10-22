@@ -22,7 +22,7 @@ final class Generator
 {
     /** Outcomes caused by our own inputs rather than by the code under test. */
     private const NOISE_EXCEPTIONS = ['TypeError', 'ArgumentCountError'];
-    private const MAX_GATE_ROUNDS = 5;
+    private const MAX_GATE_ROUNDS = 15;
 
     private readonly Runner $runner;
     private readonly Renderer $renderer;
@@ -129,7 +129,7 @@ final class Generator
     private function generateClass(array $class): ClassReport
     {
         $report = new ClassReport($class['name']);
-        if ($class['kind'] !== 'class') {
+        if (!in_array($class['kind'], ['class', 'abstract'], true)) {
             $report->error = "{$class['kind']}: skipped";
             return $report;
         }
@@ -139,7 +139,7 @@ final class Generator
         [$cases, $report->skipped] = $builder->build($class, $imports);
         $report->explored = count($cases);
         if ($cases === []) {
-            $report->error = 'no testable public method';
+            $report->error = 'no testable method';
             return $report;
         }
 

@@ -14,6 +14,8 @@ use Testor\Cases\Val;
 final class Renderer
 {
     private const INDENT = '        ';
+    /** Array arguments longer than this go in a variable, one entry per line. */
+    private const MAX_INLINE_ARRAY = 100;
     private const RECORDER = 'Testor\\Runtime\\Recorder';
 
     public static function phpString(string $s): string
@@ -34,9 +36,13 @@ final class Renderer
                             ?Imports $imports = null): array
     {
         $lines = [];
+        $expectations = []; // declared after construction: calls made while building the object don't count
         $used = ['sut' => true, 'this' => true];
-        $use = function (Arg $arg, string $key) use (&$lines, &$used, $calls, $recording, $imports): string {
-            if (!$arg->val->hoist) {
+        // A protected method is called from a closure bound to the instance, where $this is not the test.
+        $bound = $case->method['protected'] ?? false;
+        $use = function (Arg $arg, string $key) use (&$lines, &$expectations, &$used, $calls, $recording, $imports, $bound): string {
+            $long = str_starts_with($arg->val->expr, '[') && strlen($arg->val->expr) > self::MAX_INLINE_ARRAY;
+            if (!$arg->val->hoist && !$long && !($bound && str_contains($arg->val->expr, '$this'))) {
                 return $arg->val->expr;
             }
             $var = $arg->name;
@@ -44,6 +50,13 @@ final class Renderer
                 $var = $arg->name . $n;
             }
             $used[$var] = true;
+            if ($long) {
+                $formatted = self::formatArray($arg->val->expr);
+                $formatted[0] = "\$$var = {$formatted[0]}";
+                $formatted[count($formatted) - 1] .= ';';
+                array_push($lines, ...$formatted);
+                return "\$$var";
+            }
             $val = $arg->val;
             $spied = $val->spiedMethods();
             $mock = !$recording && $calls !== null && $spied !== [];
@@ -55,7 +68,14 @@ final class Renderer
                     $lines[] = '$' . $var . "->method('$method')->willReturnCallback(\\" . self::RECORDER
                         . "::spy('$key', '$method', fn () => $outcome));";
                 } elseif ($mock) {
-                    $lines[] = '$' . $var . $this->expectation($method, $val, self::callsTo($calls, $key, $method), $imports);
+                    // Return values are configured before construction (the constructor may need them),
+                    // expectations after it.
+                    if (isset($val->throws[$method])) {
+                        $lines[] = '$' . $var . "->method('$method')->willThrowException({$val->throws[$method]});";
+                    } elseif (isset($val->returns[$method])) {
+                        $lines[] = '$' . $var . "->method('$method')->willReturn({$val->returns[$method]});";
+                    }
+                    $expectations[] = '$' . $var . $this->expectation($method, $val, self::callsTo($calls, $key, $method), $imports);
                 } elseif (isset($val->throws[$method])) {
                     $lines[] = '$' . $var . "->method('$method')->willThrowException({$val->throws[$method]});";
                 } elseif (isset($val->returns[$method])) {
@@ -70,16 +90,95 @@ final class Renderer
         $name = $case->method['name'];
         if ($case->construction === null) {
             $args = $callArgs($case->args);
-            return [$lines, "$sut::$name($args)"];
+            $call = $bound ? "\\Closure::bind(static fn () => $sut::$name($args), null, $sut::class)()" : "$sut::$name($args)";
+            return [[...$lines, ...$expectations], $call];
         }
 
         $build = $case->construction;
         $ctorArgs = implode(', ', array_map(fn (Arg $a) => $use($a, "ctor:{$a->name}"), $build->args));
-        $lines[] = $build->factory !== null
-            ? "\$sut = $sut::{$build->factory}($ctorArgs);"
-            : "\$sut = new $sut($ctorArgs);";
+        $lines[] = match (true) {
+            $build->abstract !== null => "\$sut = " . self::partialMock($sut, $ctorArgs, $build->abstract) . ';',
+            $build->factory !== null => "\$sut = $sut::{$build->factory}($ctorArgs);",
+            default => "\$sut = new $sut($ctorArgs);",
+        };
+        foreach ($case->before as $prepare) {
+            $prepareName = $prepare['method']['name'];
+            $prepareArgs = implode(', ', array_map(fn (Arg $a) => $use($a, "before:{$prepareName}:{$a->name}"), $prepare['args']));
+            $lines[] = ($prepare['method']['protected'] ?? false)
+                ? "(fn () => \$this->$prepareName($prepareArgs))->call(\$sut);"
+                : "\$sut->$prepareName($prepareArgs);";
+        }
         $args = $callArgs($case->args);
-        return [$lines, "\$sut->$name($args)"];
+        $call = $bound ? "(fn () => \$this->$name($args))->call(\$sut)" : "\$sut->$name($args)";
+        return [[...$lines, ...$expectations], $call];
+    }
+
+    /** An instance of an abstract class: PHPUnit implements its abstract methods with default return values. */
+    private static function partialMock(string $sut, string $ctorArgs, array $abstract): string
+    {
+        $methods = implode(', ', array_map(self::phpString(...), $abstract));
+        return "\$this->getMockBuilder($sut::class)"
+            . ($ctorArgs === '' ? '' : "->setConstructorArgs([$ctorArgs])")
+            . "->onlyMethods([$methods])->getMock()";
+    }
+
+    /**
+     * An array literal on several lines when it is long: one entry per line, long nested arrays too.
+     *
+     * @return list<string>
+     */
+    public static function formatArray(string $expr, int $width = self::MAX_INLINE_ARRAY): array
+    {
+        $entries = strlen($expr) > $width && str_starts_with($expr, '[') && str_ends_with($expr, ']')
+            ? self::split(substr($expr, 1, -1), ',')
+            : null;
+        if ($entries === null || $entries === []) {
+            return [$expr];
+        }
+        $lines = ['['];
+        foreach ($entries as $entry) {
+            $parts = self::split($entry, '=>');
+            $value = end($parts);
+            $key = count($parts) === 2 ? $parts[0] . ' => ' : '';
+            $sub = self::formatArray($value, $width - 4 - strlen($key));
+            $sub[0] = $key . $sub[0];
+            $sub[count($sub) - 1] .= ',';
+            array_push($lines, ...array_map(fn (string $l) => '    ' . $l, $sub));
+        }
+        $lines[] = ']';
+        return $lines;
+    }
+
+    /**
+     * Parts of PHP code separated by $separator outside of strings and brackets (trimmed), or null if
+     * the code can't be tokenized.
+     *
+     * @return list<string>|null
+     */
+    private static function split(string $code, string $separator): ?array
+    {
+        $tokens = @token_get_all('<?php ' . $code);
+        array_shift($tokens);
+        $parts = [''];
+        $depth = 0;
+        foreach ($tokens as $token) {
+            $text = is_array($token) ? $token[1] : $token;
+            if (in_array($text, ['(', '[', '{'], true) || (is_array($token) && in_array($token[0], [T_CURLY_OPEN, T_DOLLAR_OPEN_CURLY_BRACES], true))) {
+                $depth++;
+            } elseif (in_array($text, [')', ']', '}'], true)) {
+                $depth--;
+            }
+            if ($depth === 0 && $text === $separator) {
+                $parts[] = '';
+            } else {
+                $parts[count($parts) - 1] .= $text;
+            }
+        }
+        $parts = array_map('trim', $parts);
+        if ($depth !== 0) {
+            return null;
+        }
+        return end($parts) === '' ? array_slice($parts, 0, -1) : $parts;
     }
 
     /** @param list<string> $setup */
@@ -106,8 +205,8 @@ final class Renderer
     }
 
     /**
-     * `->expects(...)->method(...)->with(...)->willReturn(...)` for a mocked method: never() when it was
-     * not called, once() with its arguments, or exactly(n).
+     * `->expects(...)->method(...)->with(...)->willReturn(...)` for a mocked method: never() when the
+     * tested call did not call it, once() with its arguments, or exactly(n).
      *
      * @param list<list<array>> $calls
      */
@@ -126,6 +225,7 @@ final class Renderer
         if ($count === 1 && $calls[0] !== []) {
             $line .= '->with(' . implode(', ', array_map(fn (array $a) => $this->argument($a, $imports), $calls[0])) . ')';
         }
+        // PHPUnit answers later calls with the latest matching expectation: it must return the value too.
         if (isset($val->throws[$method])) {
             $line .= "->willThrowException({$val->throws[$method]})";
         } elseif (isset($val->returns[$method])) {
@@ -191,7 +291,7 @@ final class Renderer
             [$setup, $call] = $this->arrange($case, $sut, $outcome['calls'] ?? null, imports: $imports);
             $returnsVoid = ($case->method['returnType']['name'] ?? null) === 'void';
             [$suffix, $act] = $this->assertion($outcome, $call, $returnsVoid, $imports);
-            if (self::expectsCalls($setup)) {
+            if ($suffix === 'Succeeds' && self::expectsCalls($setup)) {
                 // Mock expectations are the assertions of a void method's test.
                 $act = array_values(array_filter($act, fn (string $l) => $l !== '$this->expectNotToPerformAssertions();' && $l !== ''))
                     ?: $act;

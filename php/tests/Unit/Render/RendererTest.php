@@ -125,10 +125,13 @@ final class RendererTest extends TestCase
 
         $this->assertSame([
             '$gateway = $this->createMock(Gateway::class);',
+            "\$gateway->method('charge')->willReturn(true);",
+            "\$gateway->method('fee')->willReturn(1.5);",
+            '$sut = new Svc($gateway);',
+            // After construction: calls made while building the object are not counted.
             "\$gateway->expects(\$this->once())->method('charge')->with(3.0, \$this->isInstanceOf(Card::class))->willReturn(true);",
             "\$gateway->expects(\$this->never())->method('fee');",
             "\$gateway->expects(\$this->exactly(2))->method('log');",
-            '$sut = new Svc($gateway);',
         ], $lines);
         $this->assertSame(['use App\Card;'], $imports->lines());
     }
@@ -145,6 +148,62 @@ final class RendererTest extends TestCase
 
         $this->assertStringContainsString("\$mailer->expects(\$this->once())->method('send');", $source);
         $this->assertStringNotContainsString('expectNotToPerformAssertions', $source);
+    }
+
+    public function testAbstractClassesArePartialMocksAndProtectedMethodsAreCalledThroughABoundClosure(): void
+    {
+        $construction = new Construction(null, [new Arg('cap', new Val('1.5'))], ['rate']);
+
+        $this->assertSame(
+            [["\$sut = \$this->getMockBuilder(Discount::class)->setConstructorArgs([1.5])->onlyMethods(['rate'])->getMock();"],
+                '(fn () => $this->capped(2))->call($sut)'],
+            $this->renderer->arrange(self::scenario('capped', [new Arg('d', new Val('2'))], $construction, ['protected' => true]), 'Discount'),
+        );
+        $this->assertSame(
+            [[], '\\Closure::bind(static fn () => Util::hidden(), null, Util::class)()'],
+            $this->renderer->arrange(self::scenario('hidden', [], null, ['protected' => true]), 'Util'),
+        );
+    }
+
+    public function testPreparingCallsComeAfterConstruction(): void
+    {
+        $case = new Scenario('c0', self::method('area'), new Construction(null, []), [], before: [
+            ['method' => self::method('setWidth'), 'args' => [new Arg('w', new Val('10'))]],
+            ['method' => self::method('grow', [], ['protected' => true]), 'args' => []],
+        ]);
+
+        $this->assertSame(
+            [['$sut = new Box();', '$sut->setWidth(10);', '(fn () => $this->grow())->call($sut);'], '$sut->area()'],
+            $this->renderer->arrange($case, 'Box'),
+        );
+    }
+
+    public function testLongArraysGoInAVariableOneEntryPerLine(): void
+    {
+        $long = "['format' => 'pdf', 'paper' => 'A4', 'orientation' => 'portrait', 'margins' => [10, 10, 10, 10], 'debug' => false]";
+
+        [$setup, $call] = $this->renderer->arrange(self::scenario('load', [new Arg('settings', new Val($long))]), 'Config');
+
+        $this->assertSame([
+            '$sut = new Config();',
+            '$settings = [',
+            "    'format' => 'pdf',",
+            "    'paper' => 'A4',",
+            "    'orientation' => 'portrait',",
+            "    'margins' => [10, 10, 10, 10],",
+            "    'debug' => false,",
+            '];',
+        ], $setup);
+        $this->assertSame('$sut->load($settings)', $call);
+    }
+
+    public function testFormatArraySplitsOnlyOutsideStringsAndBrackets(): void
+    {
+        $this->assertSame(["['a, b' => [1, 2]]"], Renderer::formatArray("['a, b' => [1, 2]]"));
+        $this->assertSame(
+            ['[', "    'x' => [", "        'a, b' => str_repeat('a', 3),", "        'c' => 1,", '    ],', ']'],
+            Renderer::formatArray("['x' => ['a, b' => str_repeat('a', 3), 'c' => 1]]", 30),
+        );
     }
 
     public function testArrangeWithFactoryAndStaticCall(): void

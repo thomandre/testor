@@ -179,6 +179,97 @@ final class SourceAnalyzerTest extends TestCase
         $this->assertSame(["'user@example.com'"], self::values($methods['from']['domains']['value']));
     }
 
+    // ---- Array shapes -----------------------------------------------------------------
+
+    public function testKeysReadOnAnArrayGiveItsShape(): void
+    {
+        $body = "if (!isset(\$p['name']) || \$p['role'] !== 'admin' || !array_key_exists('id', \$p)) { return 'guest'; }"
+            . " return \$p['name'];";
+
+        $this->assertSame(["['name' => 'testor', 'role' => 'admin', 'id' => 'testor']"], self::values($this->domainOf($body, 'array $p')));
+    }
+
+    public function testShapeVariantsChangeOneKeyAtATime(): void
+    {
+        $values = self::values($this->domainOf("return \$p['mode'] === 'a' || \$p['mode'] === 'b' ? \$p['x'] : null;", 'array $p'));
+
+        $this->assertSame(["['mode' => 'a', 'x' => 'testor']", "['mode' => 'b', 'x' => 'testor']"], $values);
+    }
+
+    public function testNestedShapesAndListsOfShapes(): void
+    {
+        $body = "\$n = 0; foreach (\$p as \$row) { if (\$row['meta']['tag'] === 'x') { \$n++; } } return \$n;";
+
+        $this->assertSame(["[['meta' => ['tag' => 'x']]]"], self::values($this->domainOf($body, 'array $p')));
+    }
+
+    public function testKeyValuesFollowCastsAndFallbacks(): void
+    {
+        $body = "return [(bool) \$p['on'], \$p['n'] ?? 0, \$p['mode'] ?? self::LEVEL_INFO, \$p['unknown'] ?? \$this->x()];";
+
+        $this->assertSame(
+            ["['on' => true, 'n' => 1, 'mode' => \\App\\Sut::LEVEL_INFO]"],
+            self::values($this->domainOf($body, 'array $p')),
+            'a key with an unknown value read with a fallback is left out',
+        );
+    }
+
+    public function testDestructuredArraysAndVariableVariables(): void
+    {
+        $body = "[\$top, \$right] = \$p; return \$top * 2;";
+        $this->assertSame(['[0 => 1, 1 => 1]'], self::values($this->domainOf($body, 'array $p')));
+
+        $body = "[\$top, \$bottom] = \$w; return \$\$p;";
+        $this->assertSame(["'top'", "'bottom'"], self::values($this->domainOf($body, 'string $p, array $w')));
+    }
+
+    public function testPropertiesReadAndWrittenThroughTheClassMethods(): void
+    {
+        $methods = $this->analyse(['Box.php' => <<<'PHP'
+            namespace App;
+            final class Box
+            {
+                private int $w = 0;
+                private array $items = [];
+                public function setWidth(int $w): void { $this->w = $w; }
+                public function add(string $item): void { $this->items[] = $item; }
+                public function area(): int { return $this->width() * count($this->items); }
+                private function width(): int { return $this->w; }
+            }
+            PHP])['App\Box']['methods'];
+
+        $this->assertSame(['w'], $methods['setwidth']['writes']);
+        $this->assertSame(['items'], $methods['add']['writes']);
+        $this->assertEqualsCanonicalizing(['items', 'w'], $methods['area']['reads']);
+    }
+
+    public function testValuePassedToOwnMethodsGetsOneShapeWithAllTheirKeys(): void
+    {
+        $methods = $this->analyse(['Settings.php' => <<<'PHP'
+            namespace App;
+            final class Settings
+            {
+                private string $format;
+                private bool $debug;
+                public function __construct(array $settings = [])
+                {
+                    $this->format = $this->setFormat($settings);
+                    $this->debug = self::setDebug($settings);
+                }
+                private function setFormat(array $settings): string
+                {
+                    return in_array($settings['format'] ?? '', ['pdf', 'svg'], true) ? $settings['format'] : 'pdf';
+                }
+                private static function setDebug(array $s): bool { return isset($s['debug']) && $s['debug'] === true; }
+            }
+            PHP])['App\Settings']['methods'];
+
+        $this->assertSame(
+            ["['format' => 'testor', 'debug' => true]"],
+            self::values($methods['__construct']['domains']['settings']),
+        );
+    }
+
     public function testCaughtExceptionsAreCollectedAndFollowed(): void
     {
         $methods = $this->analyse(['Svc.php' => <<<'PHP'

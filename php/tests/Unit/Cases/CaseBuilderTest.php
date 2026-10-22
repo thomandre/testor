@@ -131,6 +131,50 @@ final class CaseBuilderTest extends TestCase
         $this->assertSame('$this->createStub(Clock::class)', $construction->args[0]->val->expr);
     }
 
+    public function testOptionalConstructorParametersWithADomainAreExplored(): void
+    {
+        $shape = self::domain([self::literal("['format' => 'pdf']", 'array')]);
+        $class = self::classDescriptor('App\Settings', [self::method('format')], [
+            self::param('settings', self::builtin('array'), ['optional' => true, 'domain' => $shape]),
+            self::param('strict', self::builtin('bool'), ['optional' => true]),
+        ]);
+
+        $scenarios = $this->build($class)[0];
+
+        $this->assertSame(['settings'], array_map(fn (Arg $a) => $a->name, $scenarios[0]->construction->args));
+        $this->assertSame(["['format' => 'pdf']", '[1, 2, 3]'], array_map(fn (Scenario $s) => $s->construction->args[0]->val->expr, $scenarios));
+    }
+
+    public function testMethodsWritingWhatTheTestedMethodReadsAreCalledBeforeIt(): void
+    {
+        $class = self::classDescriptor('App\\Box', [
+            self::method('area', [], ['reads' => ['w']]),
+            self::method('setWidth', [self::param('w', self::builtin('int'))], ['writes' => ['w']]),
+            self::method('setColor', [self::param('c', self::builtin('string'))], ['writes' => ['color']]),
+        ]);
+
+        $area = array_values(array_filter($this->build($class)[0], fn (Scenario $s) => $s->method['name'] === 'area'));
+
+        $this->assertSame([[], ['setWidth(1)'], ['setWidth(0)'], ['setWidth(-1)']], array_map(
+            fn (Scenario $s) => array_map(fn (array $b) => $b['method']['name'] . '(' . $b['args'][0]->val->expr . ')', $s->before),
+            $area,
+        ));
+        $this->assertSame(['AfterSetWidth1'], $area[1]->variations);
+    }
+
+    public function testAbstractClassesAreBuiltAsPartialMocks(): void
+    {
+        $class = ['kind' => 'abstract', 'abstractMethods' => ['rate']] + self::classDescriptor('App\Discount', [
+            self::method('apply'),
+            self::method('fromRate', [], ['static' => true, 'factory' => true]),
+        ]);
+
+        $scenarios = $this->build($class)[0];
+
+        $this->assertSame(['rate'], $scenarios[0]->construction->abstract);
+        $this->assertNull($scenarios[0]->construction->factory, 'a static factory returns a concrete subclass');
+    }
+
     public function testStubReturnValuesAreExploredOneAtATime(): void
     {
         $gateway = $this->dependency('App\Gateway', ['charge' => self::builtin('bool'), 'fee' => self::builtin('float'), 'log' => self::builtin('void')]);

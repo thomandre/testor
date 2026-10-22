@@ -28,6 +28,7 @@ use PhpParser\ParserFactory;
  *         'calls' => ['property' => [property => list<method>], 'variable' => [variable => list<method>]],
  *         'flows' => where dependency return values go (see DomainExtractor::dependencyFlows()),
  *         'catches' => exception classes caught (by the method or the class's methods it calls),
+ *         'reads', 'writes' => properties of $this read / written (also through the class's methods),
  *     ]],
  *     'readProperties' => names of properties read on other objects,
  * ]]
@@ -99,7 +100,7 @@ final class SourceAnalyzer
         $name = $class->namespacedName->toString();
         try {
             $parent = $class instanceof Stmt\Class_ ? $class->extends?->toString() : null;
-            $domains = new DomainExtractor($name, $parent, $names);
+            $domains = new DomainExtractor($name, $parent, $names, $class);
             $traits = [];
             foreach ($class->getTraitUses() as $use) {
                 foreach ($use->traits as $trait) {
@@ -187,6 +188,7 @@ final class SourceAnalyzer
             $calls = ['property' => [], 'variable' => []];
             $flows = [];
             $catches = [];
+            $state = ['reads' => [], 'writes' => []];
             foreach (array_unique($effects[$origin]) as $effect) {
                 if (preg_match('/^call:(property|variable):(\w+)->(\w+)$/', $effect, $m)) {
                     $calls[$m[1]][$m[2]][] = $m[3];
@@ -194,6 +196,8 @@ final class SourceAnalyzer
                     $flows[] = json_decode(substr($effect, 5), true);
                 } elseif (str_starts_with($effect, 'catch:')) {
                     $catches[] = substr($effect, 6);
+                } elseif (preg_match('/^(reads|writes):(\w+)$/', $effect, $m)) {
+                    $state[$m[1]][] = $m[2];
                 } else {
                     $sideEffects[] = $effect;
                 }
@@ -205,6 +209,8 @@ final class SourceAnalyzer
                 'calls' => $calls,
                 'flows' => $flows,
                 'catches' => $catches,
+                'reads' => $state['reads'],
+                'writes' => $state['writes'],
             ];
         }
 
@@ -347,7 +353,29 @@ final class SourceAnalyzer
                 $internal[] = [$kind === 'static' ? 'this' : $kind, $node->name->toLowerString()];
             }
         }
-        return [$effects, array_values(array_unique($internal, SORT_REGULAR))];
+        // Properties of $this the method writes and reads: recorded like effects so that they include
+        // those of the methods it calls. They tell which methods prepare the state another one reads.
+        $isThisProp = fn (Node $n) => $n instanceof Expr\PropertyFetch && $n->var instanceof Expr\Variable
+            && $n->var->name === 'this' && $n->name instanceof Node\Identifier;
+        $written = [];
+        $assigns = (new NodeFinder())->find($stmts, fn (Node $n) => $n instanceof Expr\Assign || $n instanceof Expr\AssignOp
+            || $n instanceof Expr\AssignRef);
+        foreach ($assigns as $assign) {
+            $target = $assign->var;
+            while ($target instanceof Expr\ArrayDimFetch) {
+                $target = $target->var;
+            }
+            if ($isThisProp($target)) {
+                $effects[] = 'writes:' . $target->name->toString();
+                $written[spl_object_id($target)] = true;
+            }
+        }
+        foreach ((new NodeFinder())->find($stmts, $isThisProp) as $fetch) {
+            if (!isset($written[spl_object_id($fetch)])) {
+                $effects[] = 'reads:' . $fetch->name->toString();
+            }
+        }
+        return [array_values(array_unique($effects)), array_values(array_unique($internal, SORT_REGULAR))];
     }
 
     private function isSideEffectFunction(string $name): bool

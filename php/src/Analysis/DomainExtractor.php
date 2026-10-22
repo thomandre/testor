@@ -31,6 +31,11 @@ final class DomainExtractor
     private const EQUALITY = [BinaryOp\Identical::class, BinaryOp\Equal::class, BinaryOp\NotIdentical::class, BinaryOp\NotEqual::class];
     private const RELATIONAL = [BinaryOp\Smaller::class, BinaryOp\SmallerOrEqual::class, BinaryOp\Greater::class,
         BinaryOp\GreaterOrEqual::class, BinaryOp\Spaceship::class];
+    /** Nesting of the array shapes inferred from key reads ($p['a']['b'] is depth 2). */
+    private const MAX_SHAPE_DEPTH = 2;
+    private const MAX_SHAPE_KEYS = 128;
+    /** Shapes per value: all keys at their first value, then variants changing one key. */
+    private const MAX_SHAPES = 5;
     private const REFINED = [
         'positive-int' => [1, 100], 'negative-int' => [-1, -100], 'non-negative-int' => [0, 1],
         'non-positive-int' => [0, -1], 'non-empty-string' => ['testor'], 'numeric-string' => ['42', '3.14'],
@@ -38,11 +43,15 @@ final class DomainExtractor
     ];
 
     private readonly NodeFinder $finder;
+    /** @var array<string, true> methods whose parameter domain is being computed (cycle guard) */
+    private array $following = [];
 
+    /** @param Stmt\ClassLike|null $class its methods' parameter domains extend to the values passed to them */
     public function __construct(
         private readonly string $className,
         private readonly ?string $parentName,
         private readonly NameContext $names,
+        private readonly ?Stmt\ClassLike $class = null,
     ) {
         $this->finder = new NodeFinder();
     }
@@ -139,21 +148,34 @@ final class DomainExtractor
 
     /**
      * Domain of a value (a variable, or a property with propertyDomain()) from how the code uses it:
-     * comparisons, in_array/array_key_exists, match/switch arms, length checks, and functions that
-     * expect a given format (filter_var, preg_match, json_decode, strtotime, explode…).
+     * the keys it reads when it is an array, comparisons, in_array/array_key_exists, match/switch arms,
+     * length checks, and functions that expect a given format (filter_var, preg_match, json_decode…).
      *
      * @param Node[] $stmts
      * @param string|callable(Node): bool $target variable name, or a matcher
      */
-    private function codeDomain(array $stmts, string|callable $target): array
+    private function codeDomain(array $stmts, string|callable $target, int $depth = 0): array
+    {
+        return self::expand($this->rawDomain($stmts, $target, $depth));
+    }
+
+    /** codeDomain() with array shapes still as structures (['shape' => …] / ['list' => …]), to be merged. */
+    private function rawDomain(array $stmts, string|callable $target, int $depth): array
     {
         $is = is_string($target) ? fn (Node $n) => $n instanceof Expr\Variable && $n->name === $target : $target;
-        $items = [];
+        $items = $depth < self::MAX_SHAPE_DEPTH ? $this->shapes($stmts, $is, $depth) : [];
         $nodes = $this->finder->find($stmts, fn (Node $n) => $n instanceof BinaryOp || $n instanceof Expr\FuncCall
-            || $n instanceof Expr\New_ || $n instanceof Expr\Match_ || $n instanceof Stmt\Switch_);
+            || $n instanceof Expr\New_ || $n instanceof Expr\Match_ || $n instanceof Stmt\Switch_
+            || $n instanceof Expr\MethodCall || $n instanceof Expr\StaticCall
+            || ($n instanceof Expr\Variable && $n->name instanceof Expr));
 
         foreach ($nodes as $node) {
-            if ($node instanceof BinaryOp) {
+            if ($node instanceof Expr\Variable && $node->name instanceof Expr && $is($node->name)) {
+                // $$side: one of the variables the method destructures.
+                array_push($items, ...array_map(self::item(...), $this->variableNames($stmts)));
+            } elseif ($node instanceof Expr\MethodCall || $node instanceof Expr\StaticCall) {
+                array_push($items, ...$this->passedOn($node, $is, $depth));
+            } elseif ($node instanceof BinaryOp) {
                 $relational = in_array($node::class, self::RELATIONAL, true);
                 if (!$relational && !in_array($node::class, self::EQUALITY, true)) {
                     continue;
@@ -192,6 +214,285 @@ final class DomainExtractor
             }
         }
         return $items;
+    }
+
+    /** @return list<string> names of the variables assigned by destructuring ([$top, $right] = …) in $stmts */
+    private function variableNames(array $stmts): array
+    {
+        $names = [];
+        foreach ($this->finder->findInstanceOf($stmts, Expr\Assign::class) as $assign) {
+            if (!$assign->var instanceof Expr\List_ && !$assign->var instanceof Expr\Array_) {
+                continue;
+            }
+            foreach (array_map(fn ($item) => $item?->value, $assign->var->items) as $target) {
+                if ($target instanceof Expr\Variable && is_string($target->name)) {
+                    $names[$target->name] = true;
+                }
+            }
+        }
+        return array_keys($names);
+    }
+
+    /**
+     * Domain of a value passed to one of the class's own methods ($this->setFormat($settings)): the
+     * domain of the parameter it is passed to, from that method's body.
+     */
+    private function passedOn(Expr\MethodCall|Expr\StaticCall $call, callable $is, int $depth): array
+    {
+        $onThis = $call instanceof Expr\MethodCall
+            ? $call->var instanceof Expr\Variable && $call->var->name === 'this'
+            : $call->class instanceof Name && in_array($call->class->toLowerString(), ['self', 'static'], true);
+        if (!$onThis || !$call->name instanceof Node\Identifier || $call->isFirstClassCallable()) {
+            return [];
+        }
+        $method = $this->class?->getMethod($call->name->toString());
+        $key = $call->name->toLowerString();
+        if ($method === null || isset($this->following[$key])) {
+            return [];
+        }
+        $items = [];
+        $this->following[$key] = true;
+        try {
+            foreach ($call->getArgs() as $i => $arg) {
+                $param = $method->params[$i] ?? null;
+                if ($arg->name === null && !$arg->unpack && $param !== null && !$param->variadic && $is($arg->value)
+                    && $param->var instanceof Expr\Variable && is_string($param->var->name)) {
+                    array_push($items, ...$this->rawDomain($method->stmts ?? [], $param->var->name, $depth));
+                }
+            }
+        } finally {
+            unset($this->following[$key]);
+        }
+        return $items;
+    }
+
+    /**
+     * Arrays holding the keys the code reads on a value ($p['key'], isset($p['key']), array_key_exists),
+     * as ['shape' => [key => values suggested by how the code uses that key]]; and lists of such arrays
+     * when the code iterates over the value (foreach ($rows as $row) … $row['key']), as ['list' => …].
+     *
+     * @param callable(Node): bool $is
+     */
+    private function shapes(array $stmts, callable $is, int $depth): array
+    {
+        $keys = [];
+        $lists = [];
+        $destructured = []; // key => variable it is assigned to
+        $nodes = $this->finder->find($stmts, fn (Node $n) => $n instanceof Expr\ArrayDimFetch
+            || $n instanceof Expr\FuncCall || $n instanceof Stmt\Foreach_ || $n instanceof Expr\Assign);
+        foreach ($nodes as $node) {
+            $key = null;
+            if ($node instanceof Expr\Assign) {
+                // [$top, $right] = $p; list('a' => $a) = $p;
+                if (($node->var instanceof Expr\List_ || $node->var instanceof Expr\Array_) && $is($node->expr)) {
+                    foreach ($node->var->items as $i => $item) {
+                        $k = $item?->key === null ? $i : $item->key;
+                        if ($item !== null && ($k = is_int($k) ? $k : (($k instanceof Scalar\String_ || $k instanceof Scalar\Int_) ? $k->value : null)) !== null
+                            && $item->value instanceof Expr\Variable && is_string($item->value->name)) {
+                            $keys[$k] = true;
+                            $destructured[$k] = $item->value->name;
+                        }
+                    }
+                }
+                continue;
+            }
+            if ($node instanceof Expr\ArrayDimFetch && $node->dim !== null && $is($node->var)) {
+                $key = $node->dim;
+            } elseif ($node instanceof Expr\FuncCall && $node->name instanceof Name && $node->name->toLowerString() === 'array_key_exists'
+                && !$node->isFirstClassCallable() && count($node->getArgs()) >= 2 && $is($node->getArgs()[1]->value)) {
+                $key = $node->getArgs()[0]->value;
+            } elseif ($node instanceof Stmt\Foreach_ && $is($node->expr) && $node->valueVar instanceof Expr\Variable
+                && is_string($node->valueVar->name) && !$is($node->valueVar)) {
+                $lists[] = $node->valueVar->name;
+            }
+            if ($key instanceof Scalar\String_ || $key instanceof Scalar\Int_) {
+                $keys[$key->value] = true;
+            }
+        }
+
+        $items = [];
+        if ($keys !== []) {
+            $entries = [];
+            foreach (array_keys($keys) as $key) {
+                $isKey = fn (Node $n) => $n instanceof Expr\ArrayDimFetch && ($n->dim instanceof Scalar\String_ || $n->dim instanceof Scalar\Int_)
+                    && $n->dim->value === $key && $is($n->var);
+                // A destructured key is used through its variable.
+                $isUse = isset($destructured[$key])
+                    ? fn (Node $n) => $n instanceof Expr\Variable && $n->name === $destructured[$key]
+                    : $isKey;
+                $values = array_values(array_unique([
+                    ...array_column(array_filter($this->codeDomain($stmts, $isUse, $depth + 1), fn (array $i) => isset($i['expr'])), 'expr'),
+                    ...$this->typeHints($stmts, $isUse),
+                ]));
+                // Unknown value with a fallback ($p['x'] ?? $this->x): leaving the key out is type-safe.
+                if ($values === [] && $this->finder->findFirst($stmts, fn (Node $n) => $n instanceof BinaryOp\Coalesce && $isKey($n->left)) !== null) {
+                    continue;
+                }
+                $entries[$key] = $values;
+            }
+            if ($entries !== []) {
+                $items[] = ['shape' => $entries];
+            }
+        }
+        foreach (array_unique($lists) as $var) {
+            // The elements are at the same nesting level: the list adds no key reads of its own.
+            $element = self::merge($this->rawDomain($stmts, $var, $depth));
+            if ($element !== []) {
+                $items[] = ['list' => $element];
+            }
+        }
+        return $items;
+    }
+
+    /**
+     * Values of the type a value is used as, when nothing else is known: from its cast ((bool) $p['x'])
+     * or its fallback ($p['x'] ?? false: true, a value of the same type that is not the default).
+     *
+     * @return list<string> PHP expressions
+     */
+    private function typeHints(array $stmts, callable $is): array
+    {
+        $hints = [];
+        $arithmetic = [BinaryOp\Plus::class, BinaryOp\Minus::class, BinaryOp\Mul::class, BinaryOp\Div::class,
+            BinaryOp\Mod::class, BinaryOp\Pow::class];
+        $nodes = $this->finder->find($stmts, fn (Node $n) => ($n instanceof Expr\Cast && $is($n->expr))
+            || ($n instanceof BinaryOp\Coalesce && $is($n->left))
+            || (in_array($n::class, $arithmetic, true) && ($is($n->left) || $is($n->right))));
+        foreach ($nodes as $node) {
+            $hint = match (true) {
+                in_array($node::class, $arithmetic, true) => '1',
+                $node instanceof Expr\Cast\Bool_ => 'true',
+                $node instanceof Expr\Cast\Int_ => '1',
+                $node instanceof Expr\Cast\Double => '1.5',
+                $node instanceof Expr\Cast\String_ => "'testor'",
+                $node instanceof Expr\Cast\Array_ => "['testor']",
+                $node instanceof BinaryOp\Coalesce => $this->otherThan($node->right),
+                default => null,
+            };
+            if ($hint !== null) {
+                $hints[] = $hint;
+            }
+        }
+        return $hints;
+    }
+
+    /** A literal of the same type as $default but different from it (the constant itself for Class::X). */
+    private function otherThan(Node $default): ?string
+    {
+        return match (true) {
+            $default instanceof Expr\ConstFetch && in_array($default->name->toLowerString(), ['true', 'false'], true)
+                => $default->name->toLowerString() === 'true' ? 'false' : 'true',
+            $default instanceof Scalar\Int_ => (string) ($default->value + 1),
+            $default instanceof Scalar\Float_ => var_export($default->value + 1.5, true),
+            $default instanceof Scalar\String_ => $default->value === 'testor' ? "'other'" : "'testor'",
+            $default instanceof Expr\Array_ => "['testor']",
+            $default instanceof Expr\ClassConstFetch && $default->class instanceof Name && $default->name instanceof Node\Identifier
+                && ($class = $this->resolveClass($default->class)) !== null => '\\' . $class . '::' . $default->name->toString(),
+            $default instanceof Expr\PropertyFetch && $default->var instanceof Expr\Variable && $default->var->name === 'this'
+                && $default->name instanceof Node\Identifier => $this->ofPropertyType($default->name->toString()),
+            default => null,
+        };
+    }
+
+    /** A value of the declared scalar type of one of the class's properties (promoted ones included). */
+    private function ofPropertyType(string $property): ?string
+    {
+        $type = null;
+        foreach ($this->class?->getProperties() ?? [] as $declaration) {
+            foreach ($declaration->props as $prop) {
+                if ($prop->name->toString() === $property) {
+                    $type = $declaration->type;
+                }
+            }
+        }
+        foreach ($this->class?->getMethod('__construct')?->params ?? [] as $param) {
+            if ($param->flags !== 0 && $param->var instanceof Expr\Variable && $param->var->name === $property) {
+                $type = $param->type;
+            }
+        }
+        if ($type instanceof Node\NullableType) {
+            $type = $type->type;
+        }
+        return $type instanceof Node\Identifier ? match ($type->toLowerString()) {
+            'bool' => 'true',
+            'int' => '1',
+            'float' => '1.5',
+            'string' => "'testor'",
+            'array' => "['testor']",
+            default => null,
+        } : null;
+    }
+
+    /** All the keys of the shapes among $items, with their values. */
+    private static function merge(array $items): array
+    {
+        $entries = [];
+        foreach ($items as $item) {
+            foreach ($item['shape'] ?? [] as $key => $values) {
+                if (isset($entries[$key]) || count($entries) < self::MAX_SHAPE_KEYS) {
+                    $entries[$key] = array_values(array_unique([...$entries[$key] ?? [], ...$values]));
+                }
+            }
+        }
+        return $entries;
+    }
+
+    /**
+     * Domain items from raw ones: a value read through several methods gets one array with all the keys
+     * they read (and variants), lists come next, then the other items.
+     */
+    private static function expand(array $items): array
+    {
+        $arrays = array_map(fn (string $expr) => ['expr' => $expr, 'type' => 'array'], self::variants(self::merge($items)));
+        $others = [];
+        foreach ($items as $item) {
+            if (isset($item['list'])) {
+                foreach (self::variants($item['list']) as $element) {
+                    $arrays[] = ['expr' => "[$element]", 'type' => 'array'];
+                }
+            } elseif (!isset($item['shape'])) {
+                $others[] = $item;
+            }
+        }
+        return [...$arrays, ...$others];
+    }
+
+    /**
+     * Array literals for a shape: every key at its first value (1 or 'testor' when none is known), then
+     * variants changing one key to another of its values.
+     *
+     * @param array<int|string, list<string>> $entries
+     * @return list<string>
+     */
+    private static function variants(array $entries): array
+    {
+        if ($entries === []) {
+            return [];
+        }
+        // Unknown values: positional entries are usually numbers (coordinates, widths, colours).
+        $base = [];
+        foreach ($entries as $key => $values) {
+            $base[$key] = $values[0] ?? (is_int($key) ? '1' : "'testor'");
+        }
+        $shapes = [$base];
+        foreach ($entries as $key => $values) {
+            foreach (array_slice($values, 1) as $value) {
+                if (count($shapes) < self::MAX_SHAPES) {
+                    $shapes[] = [...$base, $key => $value];
+                }
+            }
+        }
+        return array_map(self::arrayExpr(...), $shapes);
+    }
+
+    /** @param array<int|string, string> $entries key => PHP expression */
+    private static function arrayExpr(array $entries): string
+    {
+        $parts = [];
+        foreach ($entries as $key => $expr) {
+            $parts[] = var_export($key, true) . ' => ' . $expr;
+        }
+        return '[' . implode(', ', $parts) . ']';
     }
 
     /**
